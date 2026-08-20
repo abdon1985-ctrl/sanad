@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>سجل التنفيذ والمحاسبة — عارض القيود</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#FAFAF6; --paper-line:#E7E5DC; --ink:#1B2430; --ink-soft:#5A6472;
+    --stamp-green:#1F7A4D; --stamp-green-bg:#EAF4EE;
+    --stamp-red:#B3382C;  --stamp-red-bg:#F9ECEA;
+    --stamp-amber:#9A6B15; --stamp-amber-bg:#F8F1E2;
+    --stamp-gray:#5A6472; --stamp-gray-bg:#EFF0F2;
+    --seal:#2C4A7C; --mono:'IBM Plex Mono',monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);
+       font-family:'IBM Plex Sans Arabic',system-ui,sans-serif;
+       min-height:100vh;padding-bottom:80px}
+  .frame{max-width:860px;margin:0 auto;padding:0 16px}
+
+  header{border-bottom:3px double var(--ink);padding:28px 0 18px;margin-bottom:0}
+  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.18em;color:var(--ink-soft);
+          text-transform:uppercase;margin-bottom:6px}
+  h1{font-size:26px;font-weight:700;line-height:1.3}
+  .sub{color:var(--ink-soft);font-size:14px;margin-top:4px}
+
+  /* الأسئلة الأربعة */
+  .four{display:grid;grid-template-columns:repeat(4,1fr);border:1.5px solid var(--ink);
+        border-top:none;background:#fff}
+  .four div{padding:12px 10px;border-inline-start:1px solid var(--paper-line);text-align:center}
+  .four div:first-child{border-inline-start:none}
+  .four b{display:block;font-size:22px;font-family:var(--mono)}
+  .four span{font-size:11.5px;color:var(--ink-soft)}
+  @media(max-width:560px){.four{grid-template-columns:repeat(2,1fr)}
+    .four div:nth-child(3){border-inline-start:none;border-top:1px solid var(--paper-line)}
+    .four div:nth-child(4){border-top:1px solid var(--paper-line)}}
+
+  /* منطقة الإفلات */
+  .drop{margin:26px 0;border:1.5px dashed var(--ink-soft);background:#fff;
+        padding:34px 20px;text-align:center;cursor:pointer;transition:.15s}
+  .drop:hover,.drop.over{border-color:var(--seal);background:#F4F7FB}
+  .drop p{font-size:15px;font-weight:500}
+  .drop small{color:var(--ink-soft);font-family:var(--mono);font-size:11px}
+
+  /* القيود */
+  .register{border:1.5px solid var(--ink);background:#fff;display:none}
+  .reg-head{display:flex;justify-content:space-between;align-items:baseline;
+            padding:10px 16px;border-bottom:1.5px solid var(--ink);
+            font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .entry{border-bottom:1px solid var(--paper-line);padding:12px 16px;cursor:pointer}
+  .entry:last-child{border-bottom:none}
+  .entry:hover{background:#FCFCFA}
+  .row1{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .ts{font-family:var(--mono);font-size:11px;color:var(--ink-soft);min-width:64px}
+  .stage{font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.06em;
+         color:var(--ink);min-width:82px;text-transform:uppercase}
+  .stamp{font-family:var(--mono);font-size:10.5px;font-weight:500;padding:3px 9px;
+         border-radius:2px;border:1.2px solid;letter-spacing:.04em;
+         transform:rotate(-1.2deg);display:inline-block}
+  .st-ok  {color:var(--stamp-green);border-color:var(--stamp-green);background:var(--stamp-green-bg)}
+  .st-no  {color:var(--stamp-red);border-color:var(--stamp-red);background:var(--stamp-red-bg)}
+  .st-wait{color:var(--stamp-amber);border-color:var(--stamp-amber);background:var(--stamp-amber-bg)}
+  .st-info{color:var(--stamp-gray);border-color:var(--stamp-gray);background:var(--stamp-gray-bg)}
+  .detail{font-size:13.5px;margin-top:6px;line-height:1.7;color:var(--ink)}
+
+  .seals{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+  .seal{font-family:var(--mono);font-size:10px;color:var(--seal);
+        border:1px solid var(--seal);border-radius:2px;padding:1.5px 7px;background:#F2F6FC}
+  .seal.broken{color:var(--stamp-red);border-color:var(--stamp-red);background:var(--stamp-red-bg);
+               text-decoration:line-through}
+  .raw{display:none;margin-top:9px;background:#141A24;color:#D8E0EC;font-family:var(--mono);
+       font-size:10.5px;line-height:1.7;padding:10px 12px;border-radius:3px;
+       direction:ltr;text-align:left;overflow-x:auto;white-space:pre-wrap;word-break:break-all}
+  .entry.open .raw{display:block}
+
+  footer{margin-top:22px;font-size:11.5px;color:var(--ink-soft);font-family:var(--mono);
+         text-align:center}
+  @media (prefers-reduced-motion: reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="frame">
+  <header>
+    <div class="kicker">AGENT EXECUTION &amp; ACCOUNTABILITY LEDGER</div>
+    <h1>سجل التنفيذ والمحاسبة</h1>
+    <div class="sub">كل سطر دليل. اضغط أي قيد لرؤية السجل الخام كما كُتب.</div>
+  </header>
+
+  <div class="four" id="four" style="display:none">
+    <div><b id="qWho">—</b><span>من سمح؟ (توقيعات)</span></div>
+    <div><b id="qTerms">—</b><span>بأي شروط؟ (اشتقاقات)</span></div>
+    <div><b id="qDone">—</b><span>ماذا حدث؟ (تنفيذات)</span></div>
+    <div><b id="qBlocked">—</b><span>ماذا مُنع؟ (رفض/تصعيد)</span></div>
+  </div>
+
+  <div class="drop" id="drop">
+    <p>أسقط ملف <b>ledger.jsonl</b> هنا أو اضغط للاختيار</p>
+    <small>يُقرأ محلياً في متصفحك — لا يُرفع إلى أي مكان</small>
+    <input type="file" id="file" accept=".jsonl,.json,.txt" style="display:none">
+  </div>
+
+  <div class="register" id="register">
+    <div class="reg-head"><span id="fname">ledger.jsonl</span><span id="count"></span></div>
+    <div id="entries"></div>
+  </div>
+
+  <footer>append-only · ما حدث لا يُمحى · ما لم يُحسم لا يتحول إلى تنفيذ جديد</footer>
+</div>
+
+<script>
+const STAMP = s => {
+  if (!s) return null;
+  if (/^(EXECUTED|GRANTED|SIGNED|CLAIMED|ALLOWED)$/.test(s)) return 'st-ok';
+  if (/^(DENIED|REJECTED|BLOCKED)/.test(s)) return 'st-no';
+  if (/(ESCALATE|PENDING|AWAITING|WITHHELD|UNKNOWN|UNRESOLVED)/.test(s)) return 'st-wait';
+  return 'st-info';
+};
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function render(name, text){
+  const lines = text.split('\n').filter(l => l.trim());
+  const rowsEl = document.getElementById('entries');
+  rowsEl.innerHTML = '';
+  let who=0, terms=0, done=0, blocked=0, shown=0;
+
+  lines.forEach(line => {
+    let r; try { r = JSON.parse(line); } catch { return; }
+    shown++;
+    const st = r.state || '';
+    if (r.stage === 'pre_auth' && st === 'SIGNED') who++;
+    if (r.stage === 'approval' && st === 'GRANTED') terms++;
+    if (st === 'EXECUTED') done++;
+    if (/^(DENIED|REJECTED|BLOCKED)/.test(st) || /ESCALATE/.test(st)) blocked++;
+
+    const ts = (r.ts || r.at || '').slice(11,19) || '—';
+    const seals = [];
+    if (r.pre_auth_hash) seals.push(`<span class="seal">⌗ ${esc(r.pre_auth_hash)}</span>`);
+    if (r.signed_hash && r.current_hash){
+      seals.length = 0;
+      seals.push(`<span class="seal">وُقّع ⌗ ${esc(r.signed_hash)}</span>`);
+      seals.push(`<span class="seal broken">الآن ⌗ ${esc(r.current_hash)}</span>`);
+    }
+    if (r.derived_from) seals.push(`<span class="seal">↳ ${esc(r.derived_from)}</span>`);
+    if (r.approver)     seals.push(`<span class="seal">✍ ${esc(r.approver)}</span>`);
+    if (r.execution_id) seals.push(`<span class="seal">${esc(r.execution_id)}</span>`);
+    if (r.receipt)      seals.push(`<span class="seal">🧾 ${esc(r.receipt)}</span>`);
+    if (typeof r.amount_minor === 'number')
+      seals.push(`<span class="seal">${(r.amount_minor/100).toFixed(2)}$</span>`);
+
+    const div = document.createElement('div');
+    div.className = 'entry';
+    div.innerHTML =
+      `<div class="row1">
+         <span class="ts">${esc(ts)}</span>
+         <span class="stage">${esc(r.stage || '?')}</span>
+         ${st ? `<span class="stamp ${STAMP(st)}">${esc(st)}</span>` : ''}
+       </div>
+       ${r.detail ? `<div class="detail">${esc(r.detail)}</div>` : ''}
+       ${seals.length ? `<div class="seals">${seals.join('')}</div>` : ''}
+       <div class="raw">${esc(JSON.stringify(r, null, 1))}</div>`;
+    div.addEventListener('click', () => div.classList.toggle('open'));
+    rowsEl.appendChild(div);
+  });
+
+  document.getElementById('qWho').textContent = who;
+  document.getElementById('qTerms').textContent = terms;
+  document.getElementById('qDone').textContent = done;
+  document.getElementById('qBlocked').textContent = blocked;
+  document.getElementById('fname').textContent = name;
+  document.getElementById('count').textContent = shown + ' قيد';
+  document.getElementById('four').style.display = 'grid';
+  document.getElementById('register').style.display = 'block';
+  document.getElementById('drop').style.padding = '14px 20px';
+}
+
+const drop = document.getElementById('drop');
+const input = document.getElementById('file');
+drop.addEventListener('click', () => input.click());
+input.addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then(t => render(f.name, t));
+});
+['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add('over');
+}));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove('over');
+}));
+drop.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0]; if (!f) return;
+  f.text().then(t => render(f.name, t));
+});
+</script>
+</body>
+</html>

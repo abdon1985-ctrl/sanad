@@ -1,0 +1,15 @@
+[project]
+name = "sanad-gateway"
+version = "0.1.0"
+description = "Sanad (سند) — an execution & accountability gateway for AI agents: signed pre-authorization, atomic single-use approvals, append-only proof ledger, reality-based reconciliation."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["ai-agents", "authorization", "audit-trail", "accountability", "ledger", "governance"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sanad*"]
