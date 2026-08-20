@@ -15,8 +15,13 @@ it's whether anyone can answer, afterwards and under dispute:
 Sanad is a small, auditable gateway that sits between an agent and the world
 and makes those four questions answerable — by design, not by log-grepping.
 
+**This repository ships both halves:** the gateway (`sanad/`), and **Wakeel**
+(`wakeel/`) — a working refund agent that has *no code path to money except
+through Sanad*. You can watch it approve, escalate, and be stopped.
+
 بالعربية: «سند» بوابة تنفيذ ومحاسبة للوكلاء الأذكياء — كل فعلٍ يمرّ عبرها
 يحمل جواباً موثَّقاً: من سمح؟ بأي شروط؟ ماذا حدث فعلاً؟ وما الدليل؟
+ومعها «وكيل»: وكيل استرداد يعمل فعلاً، لا يملك طريقاً إلى المال إلا عبر سند.
 
 ## The core ideas
 
@@ -50,6 +55,34 @@ asking the provider itself (saved receipt first, metadata search as fallback):
 What happened is never erased; what is unresolved never becomes a new
 execution. Budgets are derived from the ledger's own `EXECUTED` lines — no
 parallel counter that can drift.
+
+
+## Wakeel — the agent that cannot go around the brakes
+
+A support agent's most repetitive real task is issuing refunds. `wakeel/` is
+that agent: it reads a ticket in plain language, classifies the reason, checks
+the refund policy (window, amount, charge status), and hands a *proposal* to
+Sanad. It contains no payment code. If Sanad denies, the agent stops — there
+is no second route to the provider, and a test asserts the agent exposes no
+public method that could become one.
+
+Three outcomes, and only one of them touches money:
+
+| Outcome | Meaning |
+|---|---|
+| `AUTO` | within the signed pre-authorization → Sanad derives approval and executes |
+| `ESCALATE` | outside the signed limits, or a judgement call → a human must approve |
+| `REFUSE` | the refund policy itself says no (outside the window, already settled) |
+
+One deliberate asymmetry: if Sanad denies because the **pre-authorization
+document was altered**, a human approval cannot override it. Re-signing is the
+only way back. Working *around* a broken signature would make signatures
+meaningless.
+
+Run against Stripe test mode (`wakeel/exp006_demo.py`): a five-ticket queue
+produces automatic refunds for the eligible ones, holds the rest at
+`ESCALATE_HUMAN`, and completes one of them only after a named manager
+approves it — every step in the ledger.
 
 ## Quickstart
 
@@ -98,17 +131,24 @@ this library:
 | Authorization is a policy snapshot, not a live reference | EXP-002 | `tests/test_preauth.py` |
 | One approval = one atomic claim = one provider call (10-way race, 20 rounds) | EXP-003 | `tests/test_atomicity.py` |
 | Signed pre-auth; tamper kills the document; budget from the ledger | EXP-004 | `tests/test_preauth.py` |
+| An MCP agent is forced through Sanad; six scenes over the real protocol | EXP-005 | `tests/exp005_mcp_local.py` |
+| A working agent has no path to money outside the gateway | EXP-006 | `tests/test_refund_agent.py` |
 
 ```bash
-pip install pytest && pytest tests/ -q     # 12 passed
+pip install pytest && pytest tests/ -q     # 20 passed
 ```
 
 ## Scope and honesty
 
 - This is a v0.1 single-node gateway. The atomic claim is SQLite-based:
   correct on one machine, not yet a distributed lock.
-- One provider (Stripe) is implemented; the `Provider` interface is four
-  methods — bookings and other commitments are the roadmap.
+- Two providers (Stripe payments, Stripe refunds) are implemented; the
+  `Provider` interface is four methods — bookings and other commitments are
+  the roadmap.
+- Signing records an approver *name*, not a cryptographic signature. Good
+  enough to prove the flow; not yet enough to prove identity.
+- Wakeel is a demonstration agent, not a support-desk product: it reads
+  tickets it is handed, it does not connect to a helpdesk.
 - Time-based pre-auth expiry is deliberately absent until it has its own
   test scene. A signed document carries no dead clauses.
 
