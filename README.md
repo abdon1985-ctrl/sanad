@@ -133,9 +133,10 @@ this library:
 | Signed pre-auth; tamper kills the document; budget from the ledger | EXP-004 | `tests/test_preauth.py` |
 | An MCP agent is forced through Sanad; six scenes over the real protocol | EXP-005 | `tests/exp005_mcp_local.py` |
 | A working agent has no path to money outside the gateway | EXP-006 | `tests/test_refund_agent.py` |
+| A name can be typed; a signature cannot be forged | EXP-005 | `tests/test_identity.py` |
 
 ```bash
-pip install pytest && pytest tests/ -q     # 20 passed
+pip install pytest && pytest tests/ -q     # 27 passed
 ```
 
 ## Scope and honesty
@@ -145,7 +146,7 @@ pip install pytest && pytest tests/ -q     # 20 passed
 - Two providers (Stripe payments, Stripe refunds) are implemented; the
   `Provider` interface is four methods — bookings and other commitments are
   the roadmap.
-- Signing records an approver *name*, not a cryptographic signature. Good
+- The private key lives in a local file; where it should live and how it is rotated is not yet addressed. `trusted_keys` is now the root of trust — it is an ordinary file, not itself signed.
   enough to prove the flow; not yet enough to prove identity.
 - Wakeel is a demonstration agent, not a support-desk product: it reads
   tickets it is handed, it does not connect to a helpdesk.
