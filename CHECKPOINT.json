@@ -1,0 +1,8 @@
+{
+  "height": 1,
+  "root": "e29f1297b249b49c051bfcf6617eee17c5363a43e7ad567ada2805fe6db424cd",
+  "sealed_by": "sanad-checkpoint",
+  "public_key": "PzqvN5cFcZQ9ZjEClUkhvsvNmsA0dO+kR1FEiF5sJw8=",
+  "ledger_file": "CHECKPOINT_LEDGER.jsonl",
+  "note": "Verify with sanad.chain.verify_against_published(ledger, height, root). This root is evidence only because it is published here, outside the ledger holder's control. The sealing key is ephemeral: this proves the root, not a durable identity. Key management remains an open gap."
+}
