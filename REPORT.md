@@ -11,7 +11,7 @@ unproven. If you can break a claim below, that is a contribution, not
 an embarrassment — see *How to attack this* at the end.
 
 Repository: `github.com/abdon1985-ctrl/sanad` — ~1,000 lines of
-library code, 78 tests across 12 experiments (EXP-000..011), Python,
+library code, 84 tests across 13 experiments (EXP-000..012), Python,
 no framework.
 
 ---
@@ -49,6 +49,8 @@ Every experiment follows the same discipline:
 - `chain.py` (EXP-010) — hash-chained ledger with signed checkpoints.
 - `ap2_adapter.py` (EXP-011) — Sanad as an accountability layer over
   AP2 mandates (real structures from `google-agentic-commerce/AP2`).
+- EXP-012 — daily spend derives from executions *and* settlements, so
+  money recovered from silence is money the budget can see.
 - `demos/live_three_agents.py` — the full path run against real
   Stripe (test mode), including a genuinely lost response settled by
   asking Stripe.
@@ -82,14 +84,24 @@ not become the mandate. The stated price (frozen as test B7): a *new
 legitimate* signature does not move the mandate either — moving is an
 explicit act.
 
-### F3. The budget cannot see settled spend (live Stripe demo — OPEN)
+### F3. The budget could not see settled spend (live Stripe demo)
 In the live run, ledger-derived spend read 7,000 minor units while
 Stripe had actually been charged 8,000. An execution that ended
-`UNKNOWN` and was later settled `EXECUTED` by reconciliation is
-recorded as a `resolve` row — and `spent_today_minor()` reads only
+`UNKNOWN` and was later settled `EXECUTED` by reconciliation was
+recorded as a `resolve` row — and `spent_today_minor()` read only
 `execute/EXECUTED` rows. **Money left; the budget didn't see it.**
 Found because the live demo combined chaos and budget in one path,
-which no isolated experiment had done. Not yet fixed.
+which no isolated experiment had done.
+
+**Fixed in EXP-012:** `resolve` rows now carry `amount_minor`, and
+daily spend derives from `execute/EXECUTED` + `resolve/EXECUTED`. No
+existing row is touched — the ledger stays append-only. Nothing is
+counted twice: reconciliation writes the amount only when no
+`execute/EXECUTED` row already counted that execution (the case where
+the receipt was saved and only the claim status died). One semantic
+decision is stated rather than hidden: settled spend counts on the day
+it became KNOWN, not the day it happened — the ledger refuses to
+backdate what it only just learned.
 
 ### F4. The chain proves consistency, never completeness (EXP-010,
 tests C5/C6 — limits frozen on purpose)
@@ -140,7 +152,7 @@ as "verifying AP2" should be pointed at test P8.
 ```
 git clone https://github.com/abdon1985-ctrl/sanad
 cd sanad && pip install pynacl pytest
-PYTHONPATH=. python -m pytest tests/ -q        # expect: 78 passed
+PYTHONPATH=. python -m pytest tests/ -q        # expect: 84 passed
 ```
 
 Chain and published root:
@@ -159,5 +171,5 @@ print(verify_against_published(lg, cp["height"], cp["root"]))
 Open an issue titled `external finding: <claim you broke>`. State the
 claim as this report words it, and how you broke it. The response
 will not be a defence; it will be a frozen test reproducing your
-attack, and either a fix or a named gap. That exchange — not the 78
+attack, and either a fix or a named gap. That exchange — not the 84
 green tests — is what this project considers evidence.
