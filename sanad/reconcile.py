@@ -16,10 +16,22 @@ from .providers import Provider
 def recover_on_startup(ledger: Ledger, claims: ClaimStore, provider: Provider):
     settled = []
     for approval_id, execution_id in claims.unresolved():
-        status, detail = _settle(ledger, provider, execution_id)
+        status, detail, already_counted = _settle(ledger, provider,
+                                                  execution_id)
         claims.set_status(execution_id, status)
+        # EXP-012 (F3): a settlement that establishes the money DID move
+        # is spend, and the budget must see it. The amount comes from the
+        # GRANTED approval row — the authoritative record of what was
+        # authorized. It is written ONLY when no execute/EXECUTED row
+        # already counted this execution, so the two can never sum twice.
+        amount = 0
+        if status == "EXECUTED" and not already_counted:
+            granted = ledger.last(stage="approval", state="GRANTED",
+                                  approval_id=approval_id)
+            amount = granted.get("amount_minor", 0) if granted else 0
         ledger.append("resolve", status, detail,
-                      approval_id=approval_id, execution_id=execution_id)
+                      approval_id=approval_id, execution_id=execution_id,
+                      amount_minor=amount)
         settled.append((execution_id, status))
     return settled
 
@@ -30,10 +42,12 @@ def _settle(ledger: Ledger, provider: Provider, execution_id: str):
     try:
         if receipt_row and receipt_row.get("receipt"):
             found = provider.retrieve(receipt_row["receipt"])
-            return "EXECUTED", f"receipt={found['receipt']} (direct retrieve)"
+            return ("EXECUTED",
+                    f"receipt={found['receipt']} (direct retrieve)", True)
         found = provider.find_by_execution_id(execution_id)
         if found:
-            return "EXECUTED", f"receipt={found['receipt']} (found by search)"
-        return "NOT_EXECUTED", "no trace at provider — safe to retry"
+            return ("EXECUTED",
+                    f"receipt={found['receipt']} (found by search)", False)
+        return "NOT_EXECUTED", "no trace at provider — safe to retry", False
     except Exception as e:
-        return "UNRESOLVED", f"settlement failed: {type(e).__name__}"
+        return "UNRESOLVED", f"settlement failed: {type(e).__name__}", False

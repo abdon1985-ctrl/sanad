@@ -49,10 +49,19 @@ class Ledger:
         return None
 
     def spent_today_minor(self) -> int:
-        """Daily spend derived from EXECUTED entries themselves —
-        no parallel counter that can drift (EXP-004)."""
+        """Daily spend derived from the entries themselves — no parallel
+        counter that can drift (EXP-004).
+
+        EXP-012 (finding F3): money that left through an execution whose
+        response was lost, and was later settled EXECUTED by
+        reconciliation, is real spend. It is counted here via the
+        `resolve` row's amount_minor — which reconciliation sets ONLY
+        when no execute/EXECUTED row already counted the same money, so
+        nothing is ever counted twice. Settled spend counts on the day
+        it became KNOWN, not the day it happened: the ledger refuses to
+        backdate what it only just learned."""
         today = self._now()[:10]
         return sum(r.get("amount_minor", 0) for r in self.rows()
-                   if r.get("stage") == "execute"
+                   if r.get("stage") in ("execute", "resolve")
                    and r.get("state") == "EXECUTED"
                    and r.get("ts", "").startswith(today))
