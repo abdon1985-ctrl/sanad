@@ -169,3 +169,49 @@ def test_W6_workflow_id_makes_the_decision_one_object(tmp_path):
     assert len(trace) >= 4                       # proposal + 3 endorsement
     assert all(r["workflow_id"] != other["workflow_id"] for r in trace)
     assert verify_chain(w["ledger"])["ok"]       # EXP-010 intact
+
+
+def test_W7_split_transactions_still_hit_the_daily_budget(tmp_path):
+    """Procurement can't dodge the daily budget by breaking one
+    big ask into several small ones, each within auto_limit."""
+    w = build(tmp_path, auto_limit=5000, daily_budget=12000)
+
+    amounts = [4000, 4000, 4000]
+    rows = []
+    for amt in amounts:
+        prop = w["procurement"].propose("supplier-x", amt, "USD")
+        endorsed = w["finance"].endorse(prop)
+        row = w["finance"].carry_to_sanad(endorsed)
+        rows.append((prop, row))
+
+    executed = [r for (_, r) in rows if r is not None]
+    denied = [p for (p, r) in rows if r is None]
+
+    total_executed = sum(amt for amt, (_, r) in zip(amounts, rows) if r is not None)
+    assert total_executed <= 12000
+    assert len(denied) >= 1
+
+    assert w["provider"].calls == len(executed)
+
+
+def test_W8_split_transactions_exceed_the_daily_budget(tmp_path):
+    """Procurement can't dodge the daily budget by breaking one
+    big ask into several small ones, each within auto_limit."""
+    w = build(tmp_path, auto_limit=5000, daily_budget=12000)
+
+    amounts = [4000, 4000, 4000, 4000]  # sum=16000 > daily_budget(12000)
+    rows = []
+    for amt in amounts:
+        prop = w["procurement"].propose("supplier-x", amt, "USD")
+        endorsed = w["finance"].endorse(prop)
+        row = w["finance"].carry_to_sanad(endorsed)
+        rows.append((prop, row))
+
+    executed = [r for (_, r) in rows if r is not None]
+    denied = [p for (p, r) in rows if r is None]
+
+    total_executed = sum(amt for amt, (_, r) in zip(amounts, rows) if r is not None)
+    assert total_executed <= 12000
+    assert len(denied) >= 1
+
+    assert w["provider"].calls == len(executed)
