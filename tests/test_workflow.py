@@ -271,3 +271,59 @@ def test_W10_proposal_cannot_amplify_execution_authority(tmp_path):
     terms = json.loads(w["doc"].read_text(encoding="utf-8"))
     assert terms["auto_limit_minor"] == 5000
     assert terms["daily_budget_minor"] == 20000
+
+# ---------------------------------------------------------------- Provider Execution Semantics
+
+class FailingProvider:
+    """Simulates a provider that loses the response after executing."""
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, amount_minor, currency, execution_id):
+        self.calls += 1
+        raise TimeoutError("Simulated timeout — response lost")
+
+    def find_by_execution_id(self, execution_id):
+        return None
+
+    def retrieve(self, receipt):
+        raise NotImplementedError
+
+
+def test_try_claim_prevents_double_execution(tmp_path):
+    """Sanad's atomic claim ensures the same approval cannot be executed twice.
+    The provider must receive exactly one call even if execute() is invoked
+    directly with the same approval dict."""
+    w = build(tmp_path)
+
+    approval = w["finance"].gateway.derive_approval("laptop", 3000, "USD")
+    assert approval is not None
+
+    row1 = w["finance"].gateway.execute(approval)
+    assert row1["state"] == "EXECUTED"
+    assert w["provider"].calls == 1
+
+    row2 = w["finance"].gateway.execute(approval)
+    assert row2["state"] == "DENIED_APPROVAL_CONSUMED"
+    assert w["provider"].calls == 1
+
+
+def test_unknown_state_recorded_on_provider_exception(tmp_path):
+    """If the provider throws an exception (timeout, network failure),
+    Sanad records UNKNOWN — it does NOT retry and it does NOT assume failure."""
+    w = build(tmp_path)
+
+    failing = FailingProvider()
+    w["finance"].gateway.provider = failing
+
+    approval = w["finance"].gateway.derive_approval("server", 4000, "USD")
+    row = w["finance"].gateway.execute(approval)
+
+    assert row["state"] == "UNKNOWN"
+    assert failing.calls == 1
+    assert w["provider"].calls == 0
+
+    # Verify UNKNOWN was recorded in ledger
+    unknown_row = w["ledger"].last(stage="execute", state="UNKNOWN")
+    assert unknown_row is not None
+    assert unknown_row["state"] == "UNKNOWN"
