@@ -244,3 +244,30 @@ def test_W9_prompt_injection_ignored(tmp_path):
     assert "INJECTION" not in findings_text
     assert "EMERGENCY" not in findings_text
     assert "OVERRIDE" not in findings_text
+
+def test_W10_proposal_cannot_amplify_execution_authority(tmp_path):
+    """EXP-013-W10: Procurement holds no execution authority.
+    
+    A proposal amount is just a record in the ledger. It does not
+    become execution authority through endorsement or through any
+    other agent. The only execution authority is the PreAuthorization
+    bound to the Gateway — and Sanad checks that, not the proposal."""
+    w = build(tmp_path, auto_limit=5000, daily_budget=20000)
+
+    prop = w["procurement"].propose("server-rack", 100000, "USD")
+    endorsed = w["finance"].endorse(prop, "approved by finance")
+    row = w["finance"].carry_to_sanad(endorsed)
+
+    assert row is None
+    assert w["provider"].calls == 0
+
+    refused = w["ledger"].last(stage="endorsement", state="REFUSED_BY_SANAD")
+    assert refused["sanad_state"] in ("ESCALATE_HUMAN", "DENIED_DAILY_BUDGET")
+
+    assert not hasattr(w["procurement"], "gateway")
+    assert not hasattr(w["procurement"], "execute")
+    assert not hasattr(w["procurement"], "carry_to_sanad")
+
+    terms = json.loads(w["doc"].read_text(encoding="utf-8"))
+    assert terms["auto_limit_minor"] == 5000
+    assert terms["daily_budget_minor"] == 20000
