@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """The Action Gateway — one execution path for everyone.
 
-The only difference between autonomous and human-approved execution is the
+The only difference between autonomous and human-approved paths is the
 `approver` field. Flow (proven across EXP-000..004):
 
     request -> derive approval from signed pre-auth?
-      yes, within limits -> approval GRANTED (derived_from=...) -> atomic claim -> execute
-      no                 -> ESCALATE_HUMAN / DENIED (with reason), zero provider calls
+    yes, within limits -> approval GRANTED (derived_from=...) -> atomic
+    claim -> execute -> settle
+    no                  -> ESCALATE_HUMAN / DENIED (with reason), zero provider
+    calls
 
 Invariants enforced here:
 - No execution without a matching approval (amount + currency exactly).
@@ -30,7 +32,7 @@ class Gateway:
         self.pre_auth = pre_auth
         self.provider = provider
 
-    # ---------- approval derivation (EXP-004) ----------
+    # ---------- approval derivation (EXP-000..002) ----------
     def derive_approval(self, item: str, amount_minor: int, currency: str):
         sig = self.pre_auth.current_signature()
         if sig is None:
@@ -46,7 +48,7 @@ class Gateway:
                 signed_hash=sig["pre_auth_hash"], current_hash=current_hash)
             return None
 
-        terms = sig["terms"]  # snapshot from the ledger, never the live file
+        terms = sig["terms"]
         if currency.upper() != terms.get("currency", "USD").upper():
             self.ledger.append("approval", "DENIED",
                                f"currency {currency} outside pre-auth "
@@ -77,11 +79,12 @@ class Gateway:
             pre_auth_hash=sig["pre_auth_hash"],
             approver=sig["approver"] + " (pre-auth)",
             amount_minor=amount_minor, currency=currency, item=item)
+
         return {"approval_id": approval_id, "amount_minor": amount_minor,
                 "currency": currency, "item": item}
 
-    def grant_human_approval(self, item, amount_minor, currency, approver: str):
-        """The human path — same shape, human approver, zero derivation."""
+    def grant_human_approval(self, item: str, amount_minor: int,
+                             currency: str, approver: str):
         approval_id = "AP-" + uuid.uuid4().hex[:8]
         self.ledger.append(
             "approval", "GRANTED",
@@ -89,13 +92,44 @@ class Gateway:
             f"{amount_minor} {currency}",
             approval_id=approval_id, approver=approver,
             amount_minor=amount_minor, currency=currency, item=item)
+
         return {"approval_id": approval_id, "amount_minor": amount_minor,
                 "currency": currency, "item": item}
 
-    # ---------- execution (EXP-003 core) ----------
+    # ---------- execution (EXP-003 core, EXP-014 payload binding) ------
     def execute(self, approval: dict):
         if approval is None:
             return None
+        approval_id = approval.get("approval_id")
+
+        # (0) EXP-014 — the execution request must match the payload that
+        #     was actually authorized at derive_approval() time. The GRANTED
+        #     row is the immutable snapshot; nothing later can rewrite it.
+        #     Checked BEFORE the claim, so a rejected tamper attempt never
+        #     consumes the approval — the original, untampered payload
+        #     remains executable afterward.
+        granted = self.ledger.last(stage="approval", state="GRANTED",
+                                   approval_id=approval_id)
+        if granted is None:
+            return self.ledger.append(
+                "execute", "DENIED_NO_SNAPSHOT",
+                f"{approval_id} has no GRANTED snapshot — nothing to "
+                "verify against; approval not consumed, no provider call",
+                approval_id=approval_id)
+        expected = {"item": granted.get("item"),
+                   "amount_minor": granted.get("amount_minor"),
+                   "currency": granted.get("currency")}
+        actual = {"item": approval.get("item"),
+                 "amount_minor": approval.get("amount_minor"),
+                 "currency": approval.get("currency")}
+        if actual != expected:
+            return self.ledger.append(
+                "execute", "DENIED_PAYLOAD_MISMATCH",
+                f"{approval_id} execution payload {actual} does not match "
+                f"authorized snapshot {expected} — approval not consumed, "
+                "no provider call",
+                approval_id=approval_id, expected=expected, actual=actual)
+
         execution_id = "EX-" + uuid.uuid4().hex[:8]
 
         # (1) atomic claim in SQLite — the race arbiter
@@ -105,7 +139,6 @@ class Gateway:
                 f"{approval['approval_id']} already claimed",
                 approval_id=approval["approval_id"])
 
-        # (2) proof line in the ledger — after atomicity, before the world
         self.ledger.append("claim", "CLAIMED",
                            f"{approval['approval_id']} -> {execution_id}",
                            approval_id=approval["approval_id"],
@@ -117,7 +150,6 @@ class Gateway:
                            amount_minor=approval["amount_minor"],
                            currency=approval["currency"])
 
-        # (3) touch the world
         try:
             result = self.provider.execute(approval["amount_minor"],
                                            approval["currency"], execution_id)
@@ -132,8 +164,6 @@ class Gateway:
             return self.ledger.append("execute", "REJECTED", str(e),
                                       execution_id=execution_id)
         except Exception as e:
-            # UNKNOWN: response never arrived. Stays PENDING for reconcile —
-            # the approval stays burned; settlement comes from reality.
             return self.ledger.append("execute", "UNKNOWN",
                                       f"({type(e).__name__}) response lost",
                                       execution_id=execution_id)
