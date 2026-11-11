@@ -1,0 +1,1108 @@
+diff --git a/sanad/claims.py b/sanad/claims.py
+index 1d4e199..985e571 100644
+--- a/sanad/claims.py
++++ b/sanad/claims.py
+@@ -11,6 +11,7 @@ Rules proven in EXP-003 (20 rounds x 10 concurrent workers, zero failures):
+   never by reusing the approval.
+ """
+ import sqlite3
++import time
+ 
+ 
+ class ClaimStore:
+@@ -22,6 +23,7 @@ class ClaimStore:
+                 execution_id TEXT UNIQUE NOT NULL,
+                 status       TEXT NOT NULL DEFAULT 'PENDING')""")
+             c.execute("CREATE INDEX IF NOT EXISTS idx_status ON executions(status)")
++            _ensure_reservations(c)
+ 
+     def _conn(self):
+         c = sqlite3.connect(self.db_path, timeout=5)
+@@ -42,13 +44,6 @@ class ClaimStore:
+         finally:
+             c.close()
+ 
+-    def set_status(self, execution_id: str, status: str):
+-        c = self._conn()
+-        c.execute("UPDATE executions SET status=? WHERE execution_id=?",
+-                  (status, execution_id))
+-        c.commit()
+-        c.close()
+-
+     def unresolved(self) -> list:
+         """PENDING and UNRESOLVED both re-enter recovery — UNRESOLVED is
+         'settlement failed this time', not a terminal state (EXP-003)."""
+@@ -65,3 +60,213 @@ class ClaimStore:
+                         (execution_id,)).fetchone()
+         c.close()
+         return row[0] if row else None
++
++    def _tx(self):
++        """Autocommit connection for explicit BEGIN IMMEDIATE transactions.
++        BEGIN IMMEDIATE takes the write lock up front, so it serialises writers
++        across THREADS AND PROCESSES, not just within one interpreter."""
++        c = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
++        c.execute("PRAGMA journal_mode=WAL")
++        _ensure_reservations(c)
++        return c
++
++    def reserve(self, approval_id, amount_minor, day, budget_minor,
++                expires_at=None, gated=True, now=None):
++        """Atomically check-and-hold budget. Returns (ok, committed_before).
++
++        gated=False (human approvals) records the hold WITHOUT enforcing the
++        budget — preserving the pre-EXP-016 behaviour that a human approval is
++        not budget-gated — but the amount still counts as spend for every
++        later gated check."""
++        now = time.time() if now is None else now
++        c = self._tx()
++        try:
++            c.execute("BEGIN IMMEDIATE")
++            _sweep_expired(c, now)
++            committed = _committed(c, day)
++            if gated and committed + amount_minor > budget_minor:
++                c.execute("ROLLBACK")
++                return False, committed
++            c.execute("INSERT INTO reservations(approval_id,day,amount_minor,"
++                      "status,gated,created_at,expires_at) "
++                      "VALUES (?,?,?,'RESERVED',?,?,?)",
++                      (approval_id, day, int(amount_minor), 1 if gated else 0,
++                       now, expires_at))
++            c.execute("COMMIT")
++            return True, committed
++        except BaseException:
++            try:
++                c.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++            raise
++        finally:
++            c.close()
++
++    def begin_send(self, approval_id, execution_id):
++        """One transaction: the reservation must be RESERVED, the claim row is
++        inserted, the reservation becomes SENT. Returns 'OK' | 'CONSUMED' |
++        'NO_RESERVATION' | 'RESERVATION_<STATUS>'. Nothing is consumed unless
++        'OK' — a refused attempt never burns the approval."""
++        c = self._tx()
++        try:
++            c.execute("BEGIN IMMEDIATE")
++            row = c.execute("SELECT status FROM reservations WHERE approval_id=?",
++                            (approval_id,)).fetchone()
++            if row is None:
++                c.execute("ROLLBACK")
++                return "NO_RESERVATION"
++            if c.execute("SELECT 1 FROM executions WHERE approval_id=?",
++                         (approval_id,)).fetchone():
++                c.execute("ROLLBACK")
++                return "CONSUMED"
++            if row[0] != "RESERVED":
++                c.execute("ROLLBACK")
++                return "RESERVATION_" + row[0]
++            c.execute("INSERT INTO executions VALUES (?,?,'PENDING')",
++                      (approval_id, execution_id))
++            c.execute("UPDATE reservations SET status='SENT', execution_id=? "
++                      "WHERE approval_id=? AND status='RESERVED'",
++                      (execution_id, approval_id))
++            c.execute("COMMIT")
++            return "OK"
++        except BaseException:
++            try:
++                c.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++            raise
++        finally:
++            c.close()
++
++    def committed_minor(self, day):
++        c = self._tx()
++        try:
++            return _committed(c, day)
++        finally:
++            c.close()
++
++    def release_expired(self, now=None):
++        """Explicit sweep. Returns the approval_ids released as EXPIRED."""
++        now = time.time() if now is None else now
++        c = self._tx()
++        try:
++            c.execute("BEGIN IMMEDIATE")
++            ids = [r[0] for r in c.execute(
++                "SELECT approval_id FROM reservations WHERE status='RESERVED' "
++                "AND expires_at IS NOT NULL AND expires_at<=?", (now,))]
++            _sweep_expired(c, now)
++            c.execute("COMMIT")
++            return ids
++        finally:
++            c.close()
++
++    def release_orphan(self, approval_id, now=None):
++        """RESERVED -> RELEASED(ORPHAN). Refuses anything not RESERVED: a SENT
++        or CONSUMED hold is never released here. Returns True if released."""
++        now = time.time() if now is None else now
++        c = self._tx()
++        try:
++            c.execute("BEGIN IMMEDIATE")
++            n = c.execute(
++                "UPDATE reservations SET status='RELEASED', "
++                "release_reason='ORPHAN', released_at=? "
++                "WHERE approval_id=? AND status='RESERVED' "
++                "AND NOT EXISTS (SELECT 1 FROM executions WHERE approval_id=?)",
++                (now, approval_id, approval_id)).rowcount
++            c.execute("COMMIT")
++            return n == 1
++        finally:
++            c.close()
++
++    def reservation_rows(self):
++        c = self._tx()
++        try:
++            c.row_factory = sqlite3.Row
++            return [dict(r) for r in c.execute(
++                "SELECT * FROM reservations ORDER BY created_at, approval_id")]
++        finally:
++            c.close()
++
++    def set_status(self, execution_id: str, status: str):
++        """Status of the claim AND its reservation, in ONE transaction.
++        EXECUTED -> CONSUMED (only from SENT); REJECTED / NOT_EXECUTED ->
++        RELEASED (only from SENT). Anything else (PENDING, UNRESOLVED, ...)
++        leaves the reservation SENT — held. CONSUMED and RELEASED are terminal,
++        so a repeated or contradictory status can never return budget twice."""
++        c = self._tx()
++        try:
++            c.execute("BEGIN IMMEDIATE")
++            c.execute("UPDATE executions SET status=? WHERE execution_id=?",
++                      (status, execution_id))
++            if status == "EXECUTED":
++                c.execute("UPDATE reservations SET status='CONSUMED' "
++                          "WHERE execution_id=? AND status='SENT'",
++                          (execution_id,))
++            elif status in ("REJECTED", "NOT_EXECUTED"):
++                c.execute("UPDATE reservations SET status='RELEASED', "
++                          "release_reason=?, released_at=? "
++                          "WHERE execution_id=? AND status='SENT'",
++                          (status, time.time(), execution_id))
++            c.execute("COMMIT")
++        except BaseException:
++            try:
++                c.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++            raise
++        finally:
++            c.close()
++
++
++# ======================================================================
++# EXP-016 — atomic budget reservation (fix for GAP-BUDGET-1)
++# ======================================================================
++# A GRANTED approval now holds budget from the moment it is granted, in the
++# same SQLite file that already arbitrates the claim. State machine:
++#
++#   RESERVED --begin_send--> SENT --EXECUTED--> CONSUMED   (counts, final)
++#      |                       `---REJECTED/NOT_EXECUTED--> RELEASED
++#      `--expired / orphan--> RELEASED
++#
++# Counted against the day's budget: RESERVED, SENT, CONSUMED.  SENT includes
++# UNKNOWN: money in flight stays held until settlement says otherwise.
++# Only ever released: RESERVED (expiry/orphan) and SENT (settled as not
++# executed or rejected). CONSUMED and RELEASED are terminal.
++#
++# The budget DAY is the day of reservation (UTC date from the ledger clock).
++# It is deliberately separate from the day money actually moved and the day
++# settlement was learned: Ledger.spent_today_minor() (F3: counted on the
++# day it became KNOWN) is untouched and remains the accounting view.
++COUNTED = ("RESERVED", "SENT", "CONSUMED")
++
++
++def _ensure_reservations(c):
++    c.execute("""CREATE TABLE IF NOT EXISTS reservations(
++        approval_id    TEXT PRIMARY KEY,
++        day            TEXT NOT NULL,
++        amount_minor   INTEGER NOT NULL,
++        status         TEXT NOT NULL,
++        gated          INTEGER NOT NULL DEFAULT 1,
++        created_at     REAL NOT NULL,
++        expires_at     REAL,
++        execution_id   TEXT,
++        release_reason TEXT,
++        released_at    REAL)""")
++    c.execute("CREATE INDEX IF NOT EXISTS idx_res_day ON reservations(day)")
++    c.execute("CREATE INDEX IF NOT EXISTS idx_res_exec "
++              "ON reservations(execution_id)")
++
++def _committed(c, day):
++    return c.execute(
++        "SELECT COALESCE(SUM(amount_minor),0) FROM reservations "
++        "WHERE day=? AND status IN ('RESERVED','SENT','CONSUMED')",
++        (day,)).fetchone()[0]
++
++
++def _sweep_expired(c, now):
++    """RESERVED rows past expires_at give their budget back. SENT never."""
++    c.execute("UPDATE reservations SET status='RELEASED', "
++              "release_reason='EXPIRED', released_at=? "
++              "WHERE status='RESERVED' AND expires_at IS NOT NULL "
++              "AND expires_at<=?", (now, now))
+diff --git a/sanad/gateway.py b/sanad/gateway.py
+index ab8485a..f373f64 100644
+--- a/sanad/gateway.py
++++ b/sanad/gateway.py
+@@ -13,9 +13,15 @@ The only difference between autonomous and human-approved paths is the
+ Invariants enforced here:
+ - No execution without a matching approval (amount + currency exactly).
+ - Approval is consumed by an atomic claim BEFORE the provider call.
++- EXP-016: a GRANTED approval holds its budget from the moment it is
++  granted (atomic reservation in claims.db), so approvals that have not
++  executed yet — and executions whose outcome is UNKNOWN — still count
++  against the daily budget. execute() refuses any approval that has no
++  live reservation.
+ - Tampered pre-auth document => the whole document falls (EXP-004).
+ - Silence is cancellation, never consent.
+ """
++import time
+ import uuid
+ 
+ from .claims import ClaimStore
+@@ -32,6 +38,26 @@ class Gateway:
+         self.pre_auth = pre_auth
+         self.provider = provider
+ 
++    # ---------- EXP-016 hooks (TimedGateway overrides both) ----------
++    def _now_epoch(self) -> float:
++        return time.time()
++
++    def _reservation_expiry(self, sig):
++        """Epoch second after which an UNEXECUTED reservation gives its
++        budget back, derived from SIGNED terms only. The plain Gateway has
++        no approval lifetime, so None (never expires)."""
++        return None
++
++    def _release_expired_and_log(self):
++        """Give back the budget of unexecuted reservations past their signed
++        expiry, and put each release in the ledger (reason EXPIRED). Never
++        touches SENT/CONSUMED."""
++        for aid in self.claims.release_expired(now=self._now_epoch()):
++            self.ledger.append(
++                "reserve", "RELEASED",
++                f"{aid} expired unexecuted — budget returned",
++                approval_id=aid, reason="EXPIRED")
++
+     # ---------- approval derivation (EXP-000..002) ----------
+     def derive_approval(self, item: str, amount_minor: int, currency: str):
+         sig = self.pre_auth.current_signature()
+@@ -63,14 +89,26 @@ class Gateway:
+                                f"{amount_minor} above auto limit "
+                                f"{terms['auto_limit_minor']}")
+             return None
+-        spent = self.ledger.spent_today_minor()
+-        if spent + amount_minor > terms["daily_budget_minor"]:
++        # EXP-016: check-and-hold in ONE atomic SQLite transaction. The old
++        # check read spent_today_minor() (EXECUTED rows only), so granted-
++        # but-unexecuted approvals were invisible to it (GAP-BUDGET-1).
++        self._release_expired_and_log()
++        approval_id = "AP-" + uuid.uuid4().hex[:8]
++        day = self.ledger._now()[:10]
++        expires_at = self._reservation_expiry(sig)
++        ok, committed = self.claims.reserve(
++            approval_id, amount_minor, day, terms["daily_budget_minor"],
++            expires_at=expires_at, gated=True, now=self._now_epoch())
++        if not ok:
+             self.ledger.append("approval", "DENIED_DAILY_BUDGET",
+-                               f"spent {spent} + {amount_minor} exceeds "
++                               f"committed {committed} + {amount_minor} exceeds "
+                                f"{terms['daily_budget_minor']}")
+             return None
+ 
+-        approval_id = "AP-" + uuid.uuid4().hex[:8]
++        # Reservation first, ledger GRANTED second: a crash between the two
++        # leaves an ORPHAN reservation (budget held, nobody holds the
++        # approval) that recovery releases only under the strict rule in
++        # reconcile.recover_reservations — never the reverse.
+         self.ledger.append(
+             "approval", "GRANTED",
+             f"{approval_id} derived from {sig['pre_auth_id']} — "
+@@ -78,20 +116,30 @@ class Gateway:
+             approval_id=approval_id, derived_from=sig["pre_auth_id"],
+             pre_auth_hash=sig["pre_auth_hash"],
+             approver=sig["approver"] + " (pre-auth)",
+-            amount_minor=amount_minor, currency=currency, item=item)
++            amount_minor=amount_minor, currency=currency, item=item,
++            reservation_day=day, expires_at=expires_at)
+ 
+         return {"approval_id": approval_id, "amount_minor": amount_minor,
+                 "currency": currency, "item": item}
+ 
+     def grant_human_approval(self, item: str, amount_minor: int,
+-                             currency: str, approver: str):
++                             currency: str, approver: str, expires_at=None):
+         approval_id = "AP-" + uuid.uuid4().hex[:8]
++        day = self.ledger._now()[:10]
++        # EXP-016: not budget-gated (unchanged behaviour: a human may
++        # approve beyond the daily budget) but it IS spend — it reserves,
++        # is counted by every later gated check, and executes through the
++        # same state machine.
++        self.claims.reserve(approval_id, amount_minor, day, 0,
++                            expires_at=expires_at, gated=False,
++                            now=self._now_epoch())
+         self.ledger.append(
+             "approval", "GRANTED",
+             f"{approval_id} by human {approver} — {item} for "
+             f"{amount_minor} {currency}",
+             approval_id=approval_id, approver=approver,
+-            amount_minor=amount_minor, currency=currency, item=item)
++            amount_minor=amount_minor, currency=currency, item=item,
++            reservation_day=day, expires_at=expires_at)
+ 
+         return {"approval_id": approval_id, "amount_minor": amount_minor,
+                 "currency": currency, "item": item}
+@@ -132,12 +180,23 @@ class Gateway:
+ 
+         execution_id = "EX-" + uuid.uuid4().hex[:8]
+ 
+-        # (1) atomic claim in SQLite — the race arbiter
+-        if not self.claims.try_claim(approval["approval_id"], execution_id):
++        # (1) atomic claim in SQLite — the race arbiter. EXP-016: claim and
++        #     reservation RESERVED->SENT happen in ONE transaction, and only
++        #     a live reservation can be claimed.
++        res = self.claims.begin_send(approval["approval_id"], execution_id)
++        if res == "CONSUMED":
+             return self.ledger.append(
+                 "execute", "DENIED_APPROVAL_CONSUMED",
+                 f"{approval['approval_id']} already claimed",
+                 approval_id=approval["approval_id"])
++        if res != "OK":
++            state = ("DENIED_NO_RESERVATION" if res == "NO_RESERVATION"
++                     else "DENIED_" + res)
++            return self.ledger.append(
++                "execute", state,
++                f"{approval['approval_id']} has no live budget reservation "
++                f"({res}) — approval not consumed, no provider call",
++                approval_id=approval["approval_id"])
+ 
+         self.ledger.append("claim", "CLAIMED",
+                            f"{approval['approval_id']} -> {execution_id}",
+diff --git a/sanad/gateway_timed.py b/sanad/gateway_timed.py
+index 259bc09..56c80b1 100644
+--- a/sanad/gateway_timed.py
++++ b/sanad/gateway_timed.py
+@@ -32,6 +32,26 @@ class TimedGateway(Gateway):
+         super().__init__(ledger, claims, pre_auth, provider)
+         self.clock = clock
+ 
++    # ---------- EXP-016: reservation clock + signed-terms expiry ------
++    def _now_epoch(self) -> float:
++        return self.clock()
++
++    def _reservation_expiry(self, sig):
++        """min(approval expiry, mandate expiry), from SIGNED terms only —
++        never from the approval dict a caller holds. Used ONLY to give an
++        unexecuted reservation's budget back; the execute-time TTL check
++        below still reads the caller's dict (that is EXP-017, not fixed)."""
++        terms = (sig or {}).get("terms", {})
++        cands = []
++        ttl = terms.get("approval_ttl_seconds")
++        if ttl is not None:
++            cands.append(self.clock() + ttl)
++        valid_days = terms.get("valid_days")
++        signed_at = (sig or {}).get("signed_at")
++        if valid_days is not None and signed_at is not None:
++            cands.append(signed_at + valid_days * 86400)
++        return min(cands) if cands else None
++
+     # ---------- derivation: full authorization first, honest states ----
+     def derive_approval(self, item: str, amount_minor: int, currency: str):
+         if isinstance(self.pre_auth, TimedSignedPreAuthorization):
+@@ -57,8 +77,10 @@ class TimedGateway(Gateway):
+ 
+     def grant_human_approval(self, item, amount_minor, currency,
+                              approver: str, ttl_seconds=None):
+-        approval = super().grant_human_approval(item, amount_minor,
+-                                                currency, approver)
++        approval = super().grant_human_approval(
++            item, amount_minor, currency, approver,
++            expires_at=(self.clock() + ttl_seconds
++                        if ttl_seconds is not None else None))
+         approval["issued_at"] = self.clock()
+         approval["ttl_seconds"] = ttl_seconds
+         return approval
+diff --git a/sanad/reconcile.py b/sanad/reconcile.py
+index b0fbf0d..8284828 100644
+--- a/sanad/reconcile.py
++++ b/sanad/reconcile.py
+@@ -13,7 +13,11 @@ from .ledger import Ledger
+ from .providers import Provider
+ 
+ 
+-def recover_on_startup(ledger: Ledger, claims: ClaimStore, provider: Provider):
++def recover_on_startup(ledger: Ledger, claims: ClaimStore, provider: Provider,
++                       now=None, orphan_grace_seconds=60):
++    """Settle every PENDING/UNRESOLVED execution, then (EXP-016) reconcile
++    reservations. Return value is unchanged: the settled list. `now` is in
++    the same clock domain as the gateway that created the reservations."""
+     settled = []
+     for approval_id, execution_id in claims.unresolved():
+         status, detail, already_counted = _settle(ledger, provider,
+@@ -33,6 +37,9 @@ def recover_on_startup(ledger: Ledger, claims: ClaimStore, provider: Provider):
+                       approval_id=approval_id, execution_id=execution_id,
+                       amount_minor=amount)
+         settled.append((execution_id, status))
++    if hasattr(claims, "reservation_rows"):
++        recover_reservations(ledger, claims, now=now,
++                             orphan_grace_seconds=orphan_grace_seconds)
+     return settled
+ 
+ 
+@@ -51,3 +58,115 @@ def _settle(ledger: Ledger, provider: Provider, execution_id: str):
+         return "NOT_EXECUTED", "no trace at provider — safe to retry", False
+     except Exception as e:
+         return "UNRESOLVED", f"settlement failed: {type(e).__name__}", False
++
++
++# ======================================================================
++# EXP-016 — reservation recovery and verification
++# ======================================================================
++import time as _time
++
++_SEND_STAGES = ("claim", "pre-action", "execute", "resolve")
++
++
++def _ledger_index(ledger):
++    granted, send_evidence, executed, released, anomalies = (
++        set(), set(), set(), set(), set())
++    for r in ledger.rows():
++        aid, eid = r.get("approval_id"), r.get("execution_id")
++        st, state = r.get("stage"), r.get("state")
++        if st == "approval" and state == "GRANTED" and aid:
++            granted.add(aid)
++        if st in _SEND_STAGES:
++            if aid:
++                send_evidence.add(aid)
++            if eid:
++                send_evidence.add(eid)
++        if st in ("execute", "resolve") and state == "EXECUTED" and eid:
++            executed.add(eid)
++        if st == "reserve" and state == "RELEASED" and aid:
++            released.add(aid)
++        if st == "reserve" and state == "ANOMALY" and aid:
++            anomalies.add((aid, r.get("kind")))
++    return granted, send_evidence, executed, released, anomalies
++
++
++def recover_reservations(ledger: Ledger, claims: ClaimStore, now=None,
++                         orphan_grace_seconds=60):
++    """Return reservations to a consistent state. Rules, strictest first:
++
++    - SENT and CONSUMED are NEVER released here, whatever the ledger says.
++      Only settlement (set_status) moves them: UNKNOWN stays held.
++    - RESERVED + no GRANTED row + older than the grace window + NO send
++      evidence anywhere (claims table or ledger) -> ORPHAN, released.
++      The grace window exists because a live derive_approval may be between
++      its reserve and its GRANTED write.
++    - RESERVED + no GRANTED row + send evidence -> ANOMALY, NOT released
++      (fail closed: the budget stays held, a human looks).
++    - RESERVED past its signed expiry -> EXPIRED, released.
++    Every release is logged to the ledger once (idempotent)."""
++    now = _time.time() if now is None else now
++    granted, send_ev, _, logged_rel, logged_anom = _ledger_index(ledger)
++    out = {"released": [], "anomalies": []}
++
++    def anomaly(row, kind, detail):
++        if (row["approval_id"], kind) not in logged_anom:
++            ledger.append("reserve", "ANOMALY", detail,
++                          approval_id=row["approval_id"], kind=kind)
++        out["anomalies"].append((row["approval_id"], kind))
++
++    for aid in claims.release_expired(now=now):
++        if aid not in logged_rel:
++            ledger.append("reserve", "RELEASED",
++                          f"{aid} expired unexecuted — budget returned",
++                          approval_id=aid, reason="EXPIRED")
++            logged_rel.add(aid)
++        out["released"].append((aid, "EXPIRED"))
++
++    for row in claims.reservation_rows():
++        aid, status = row["approval_id"], row["status"]
++        if status == "RESERVED" and aid not in granted:
++            has_send = (aid in send_ev) or (row["execution_id"] is not None)
++            if has_send:
++                anomaly(row, "RESERVED_WITH_SEND_EVIDENCE_NO_GRANTED",
++                        f"{aid} RESERVED, no GRANTED row, but send evidence "
++                        "exists — held, not released")
++            elif now - row["created_at"] >= orphan_grace_seconds:
++                if claims.release_orphan(aid, now=now):
++                    ledger.append("reserve", "RELEASED",
++                                  f"{aid} orphan reservation (no GRANTED row, "
++                                  "no send evidence) — budget returned",
++                                  approval_id=aid, reason="ORPHAN")
++                    out["released"].append((aid, "ORPHAN"))
++        elif status == "SENT" and aid not in granted:
++            anomaly(row, "SENT_NO_GRANTED",
++                    f"{aid} SENT without a GRANTED row — held, not released")
++        elif (status == "RELEASED" and row["release_reason"] in
++              ("EXPIRED", "ORPHAN") and aid not in logged_rel):
++            ledger.append("reserve", "RELEASED",
++                          f"{aid} release logged late ({row['release_reason']})",
++                          approval_id=aid, reason=row["release_reason"])
++            logged_rel.add(aid)
++    return out
++
++
++def verify_reservations(ledger: Ledger, claims: ClaimStore) -> list:
++    """Independent comparison of SQLite (operational truth) and the ledger
++    (audit record). Neither is assumed complete. Report-only: it changes
++    nothing and releases nothing. Returns a list of {kind, approval_id}."""
++    granted_rows = {r["approval_id"]: r for r in ledger.rows()
++                    if r.get("stage") == "approval"
++                    and r.get("state") == "GRANTED" and r.get("approval_id")}
++    _, _, executed, _, _ = _ledger_index(ledger)
++    table = {r["approval_id"]: r for r in claims.reservation_rows()}
++    found = []
++    for aid, g in granted_rows.items():
++        if g.get("reservation_day") and aid not in table:
++            found.append({"kind": "NO_RESERVATION_ROW", "approval_id": aid})
++    for aid, row in table.items():
++        if row["status"] in ("RESERVED", "SENT", "CONSUMED") \
++                and aid not in granted_rows:
++            found.append({"kind": "NO_GRANTED_ROW", "approval_id": aid})
++        if row["status"] == "CONSUMED" and row["execution_id"] not in executed:
++            found.append({"kind": "CONSUMED_NOT_IN_LEDGER",
++                          "approval_id": aid})
++    return found
+diff --git a/tests/_exp016_os_exit_crash.py b/tests/_exp016_os_exit_crash.py
+new file mode 100644
+index 0000000..41e6922
+--- /dev/null
++++ b/tests/_exp016_os_exit_crash.py
+@@ -0,0 +1,14 @@
++# real process death (os._exit) between begin_send and the provider result
++import os, sys, json
++sys.path.insert(0, sys.argv[1])
++from sanad import Ledger, ClaimStore, Gateway, PreAuthorization
++from sanad.providers import Provider
++root = sys.argv[2]
++class Dies(Provider):
++    def execute(self, a, c, e):
++        os._exit(7)
++ledger = Ledger(os.path.join(root, "ledger.jsonl"))
++claims = ClaimStore(os.path.join(root, "claims.db"))
++pre = PreAuthorization(ledger, os.path.join(root, "pre_auth.json"))
++gw = Gateway(ledger, claims, pre, Dies())
++gw.execute(gw.derive_approval("coffee", 5000, "USD"))
+diff --git a/tests/test_exp016_reservation.py b/tests/test_exp016_reservation.py
+new file mode 100644
+index 0000000..e869948
+--- /dev/null
++++ b/tests/test_exp016_reservation.py
+@@ -0,0 +1,457 @@
++# -*- coding: utf-8 -*-
++"""EXP-016 — atomic budget reservation (acceptance tests, written FIRST).
++
++Frozen expectations for the fix to GAP-BUDGET-1: a GRANTED approval that has
++not executed yet must still count against the daily budget, atomically,
++across threads AND processes, and survive crashes.
++
++Invariant under test:  money_out + reserved_or_in_flight  <=  daily budget.
++Measurement rule: money out is read from an INDEPENDENT provider witness.
++
++Test kinds (recorded in the evidence, not hidden):
++  behavioural — assert observable behaviour; meaningful on the baseline
++  api         — touches the new ClaimStore/reconcile API; on the baseline
++                these ERROR with AttributeError/ImportError, which proves
++                nothing about behaviour, only that the API does not exist yet
++"""
++import json
++import multiprocessing as mp
++import os
++import random
++import threading
++
++from sanad import Ledger, ClaimStore, Gateway, PreAuthorization
++from sanad.gateway_timed import TimedGateway
++from sanad.identity import Signer
++from sanad.providers import Provider, ProviderRejected
++from sanad.reconcile import recover_on_startup
++from sanad.validity import TrustedKeys, TimedSignedPreAuthorization, timed_sign
++
++BUDGET, LIMIT = 10_000, 5_000
++
++
++class Crash(BaseException):
++    """Process death, not an error: the Gateway must not swallow it."""
++
++
++class Witness(Provider):
++    """Independent record of money that left (thread-safe, in-memory)."""
++    name = "memory"
++
++    def __init__(self):
++        self.calls, self.total_minor, self.records = 0, 0, {}
++        self.mode = "ok"            # ok | lost_after | reject | crash
++        self._lock = threading.Lock()
++
++    def execute(self, amount_minor, currency, execution_id):
++        with self._lock:
++            self.calls += 1
++            if self.mode == "crash":
++                raise Crash()
++            if self.mode == "reject":
++                raise ProviderRejected("card declined")
++            self.total_minor += amount_minor
++            self.records[execution_id] = {"receipt": "rc_" + execution_id,
++                                          "amount_minor": amount_minor}
++        if self.mode == "lost_after":
++            raise TimeoutError("charged, response lost")
++        return self.records[execution_id]
++
++    def find_by_execution_id(self, execution_id):
++        return self.records.get(execution_id)
++
++    def retrieve(self, receipt):
++        for r in self.records.values():
++            if r["receipt"] == receipt:
++                return r
++        raise LookupError(receipt)
++
++
++def _doc(tmp_path, budget=BUDGET, extra=None):
++    terms = {"auto_limit_minor": LIMIT, "daily_budget_minor": budget,
++             "currency": "USD", "blocked_categories": []}
++    terms.update(extra or {})
++    p = tmp_path / "pre_auth.json"
++    p.write_text(json.dumps(terms), encoding="utf-8")
++    return p
++
++
++def plain(tmp_path, budget=BUDGET, ledger_cls=Ledger):
++    ledger = ledger_cls(str(tmp_path / "ledger.jsonl"))
++    claims = ClaimStore(str(tmp_path / "claims.db"))
++    pre = PreAuthorization(ledger, str(_doc(tmp_path, budget)))
++    pre.sign("tester")
++    prov = Witness()
++    return ledger, claims, Gateway(ledger, claims, pre, prov), prov
++
++
++class Clock:
++    def __init__(self, t=1_000_000.0):
++        self.t = t
++
++    def __call__(self):
++        return self.t
++
++
++def timed(tmp_path, budget=BUDGET, extra=None, ledger_cls=Ledger):
++    clock = Clock()
++    ledger = ledger_cls(str(tmp_path / "ledger.jsonl"))
++    claims = ClaimStore(str(tmp_path / "claims.db"))
++    doc = _doc(tmp_path, budget, {"valid_days": 7, "approval_ttl_seconds": 300,
++                                  **(extra or {})})
++    m = Signer("mohamed")
++    keys = TrustedKeys(ledger, {"mohamed": m.public_key_b64}, clock=clock)
++    pre = TimedSignedPreAuthorization(ledger, str(doc), keys, clock=clock)
++    timed_sign(pre, m)
++    prov = Witness()
++    return clock, ledger, claims, TimedGateway(ledger, claims, pre, prov,
++                                               clock=clock), prov
++
++
++def states(ledger, stage):
++    return [r["state"] for r in ledger.rows() if r["stage"] == stage]
++
++
++# ------------------------------------------------------------ behavioural
++def test_R1_control_sequential_flow_enforces_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    granted = 0
++    for _ in range(6):
++        ap = gw.derive_approval("coffee", 5000, "USD")
++        if ap:
++            granted += 1
++            gw.execute(ap)
++    assert granted == 2 and prov.total_minor == BUDGET
++
++
++def test_R2_derive_all_then_execute_all_cannot_exceed_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    aps = [gw.derive_approval("coffee", 5000, "USD") for _ in range(6)]
++    granted = [a for a in aps if a]
++    assert len(granted) == 2
++    assert states(ledger, "approval").count("DENIED_DAILY_BUDGET") == 4
++    for a in granted:
++        assert gw.execute(a)["state"] == "EXECUTED"
++    assert prov.total_minor <= BUDGET and prov.calls == 2
++
++
++def test_R3_threads_forced_interleaving_cannot_exceed_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    n = 8
++    barrier, out = threading.Barrier(n), [None] * n
++
++    def worker(i):
++        ap = gw.derive_approval("coffee", 5000, "USD")
++        barrier.wait(timeout=10)
++        out[i] = gw.execute(ap) if ap else None
++
++    ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
++    [t.start() for t in ts]
++    [t.join(timeout=30) for t in ts]
++    assert sum(1 for o in out if o and o["state"] == "EXECUTED") == 2
++    assert prov.total_minor <= BUDGET and prov.calls == 2
++
++
++class FileWitness(Provider):
++    """Cross-process witness: O_APPEND line per call."""
++    name = "file"
++
++    def __init__(self, path):
++        self.path = path
++
++    def execute(self, amount_minor, currency, execution_id):
++        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
++        os.write(fd, f"{amount_minor}\n".encode())
++        os.close(fd)
++        return {"receipt": "rc_" + execution_id, "amount_minor": amount_minor}
++
++    def find_by_execution_id(self, execution_id):
++        return None
++
++    def retrieve(self, receipt):
++        raise NotImplementedError
++
++
++def _proc_worker(root, barrier, q):
++    from pathlib import Path
++    ledger = Ledger(os.path.join(root, "ledger.jsonl"))
++    claims = ClaimStore(os.path.join(root, "claims.db"))
++    pre = PreAuthorization(ledger, os.path.join(root, "pre_auth.json"))
++    gw = Gateway(ledger, claims, pre, FileWitness(os.path.join(root, "w.log")))
++    ap = gw.derive_approval("coffee", 5000, "USD")
++    barrier.wait(timeout=30)
++    q.put(gw.execute(ap)["state"] if ap else "NO_APPROVAL")
++
++
++def test_R4_separate_processes_cannot_exceed_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)        # signs pre-auth, makes db
++    ctx = mp.get_context("fork")
++    n = 6
++    barrier, q = ctx.Barrier(n), ctx.Queue()
++    ps = [ctx.Process(target=_proc_worker, args=(str(tmp_path), barrier, q))
++          for _ in range(n)]
++    [p.start() for p in ps]
++    res = [q.get(timeout=60) for _ in range(n)]
++    [p.join(timeout=30) for p in ps]
++    wlog = tmp_path / "w.log"
++    total = sum(int(x) for x in wlog.read_text().split()) if wlog.exists() else 0
++    assert res.count("EXECUTED") == 2, res
++    assert total <= BUDGET
++
++
++def test_R5_unknown_keeps_its_reservation_until_settled(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path, budget=8000)
++    assert gw.execute(gw.derive_approval("a", 5000, "USD"))["state"] == "EXECUTED"
++    prov.mode = "lost_after"
++    assert gw.execute(gw.derive_approval("b", 3000, "USD"))["state"] == "UNKNOWN"
++    prov.mode = "ok"
++    # money in flight is invisible to the ledger sum but NOT to the budget
++    assert gw.derive_approval("c", 1000, "USD") is None
++    assert states(ledger, "approval")[-1] == "DENIED_DAILY_BUDGET"
++    recover_on_startup(ledger, claims, prov)                  # EXECUTED, 8000
++    assert gw.derive_approval("c", 1000, "USD") is None       # still no room
++    assert prov.total_minor == 8000
++
++
++def test_R6_rejected_releases_the_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    prov.mode = "reject"
++    assert gw.execute(gw.derive_approval("a", 5000, "USD"))["state"] == "REJECTED"
++    prov.mode = "ok"
++    assert gw.execute(gw.derive_approval("b", 5000, "USD"))["state"] == "EXECUTED"
++    assert gw.execute(gw.derive_approval("c", 5000, "USD"))["state"] == "EXECUTED"
++    assert gw.derive_approval("d", 5000, "USD") is None
++    assert prov.total_minor == BUDGET
++
++
++def test_R7_not_executed_settlement_releases_the_budget(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    prov.mode = "crash"
++    try:
++        gw.execute(gw.derive_approval("a", 5000, "USD"))
++    except Crash:
++        pass
++    prov.mode = "ok"
++    assert gw.derive_approval("b", 5000, "USD") is not None   # 5000 in flight
++    assert gw.derive_approval("c", 5000, "USD") is None       # full: 5000+5000
++    recover_on_startup(ledger, claims, prov)                  # NOT_EXECUTED
++    assert ledger.last(stage="resolve")["state"] == "NOT_EXECUTED"
++    assert gw.derive_approval("c", 5000, "USD") is not None   # room is back
++    assert prov.calls == 1                                    # only the crash
++
++
++def test_R8_expired_unexecuted_approval_releases_its_reservation(tmp_path):
++    clock, ledger, claims, gw, prov = timed(tmp_path)
++    a1 = gw.derive_approval("a", 5000, "USD")
++    a2 = gw.derive_approval("b", 5000, "USD")
++    assert a1 and a2
++    assert gw.derive_approval("c", 5000, "USD") is None       # reserved: full
++    clock.t += 301                                            # both expire
++    a3 = gw.derive_approval("c", 5000, "USD")
++    assert a3 is not None
++    assert "RELEASED" in states(ledger, "reserve")
++    rel = [r for r in ledger.rows()
++           if r["stage"] == "reserve" and r["state"] == "RELEASED"]
++    assert {r["reason"] for r in rel} == {"EXPIRED"}
++    assert gw.execute(a3)["state"] == "EXECUTED"
++    # an expired-and-released approval can no longer spend the budget it gave up
++    a1["ttl_seconds"] = None                                  # EXP-017 trick
++    assert gw.execute(a1)["state"].startswith("DENIED")
++    assert prov.calls == 1 and prov.total_minor == 5000
++
++
++def test_R9_expiry_never_releases_a_sent_or_unknown_reservation(tmp_path):
++    clock, ledger, claims, gw, prov = timed(tmp_path, budget=5000)
++    prov.mode = "lost_after"
++    assert gw.execute(gw.derive_approval("a", 5000, "USD"))["state"] == "UNKNOWN"
++    prov.mode = "ok"
++    clock.t += 10_000                                         # way past ttl
++    recover_on_startup(ledger, claims, _Dark(), now=clock())  # cannot settle
++    assert gw.derive_approval("b", 100, "USD") is None        # still held
++    assert not [r for r in ledger.rows()
++                if r["stage"] == "reserve" and r["state"] == "RELEASED"]
++
++
++class _Dark(Provider):
++    """Provider that cannot be reached: settlement stays UNRESOLVED."""
++    def find_by_execution_id(self, execution_id):
++        raise ConnectionError("down")
++
++    def retrieve(self, receipt):
++        raise ConnectionError("down")
++
++
++def test_R10_orphan_reservation_is_released_after_grace(tmp_path):
++    """Crash between the SQLite reserve and the ledger GRANTED row."""
++    class CrashOnGranted(Ledger):
++        def append(self, stage, state, detail="", **f):
++            if stage == "approval" and state == "GRANTED":
++                raise Crash()
++            return super().append(stage, state, detail, **f)
++
++    ledger, claims, gw, prov = plain(tmp_path, ledger_cls=CrashOnGranted)
++    try:
++        gw.derive_approval("a", 5000, "USD")
++        raise AssertionError("expected crash")
++    except Crash:
++        pass
++    ok = Ledger(str(tmp_path / "ledger.jsonl"))               # restart
++    gw2 = Gateway(ok, ClaimStore(str(tmp_path / "claims.db")), gw.pre_auth, prov)
++    gw2.derive_approval("b", 5000, "USD")                     # orphan holds 5000
++    assert gw2.derive_approval("c", 5000, "USD") is None
++    import time
++    # inside the grace window a live derive might still be writing: no release
++    recover_on_startup(ok, gw2.claims, prov, now=time.time(),
++                       orphan_grace_seconds=3600)
++    assert gw2.derive_approval("c", 5000, "USD") is None
++    recover_on_startup(ok, gw2.claims, prov, now=time.time() + 7200,
++                       orphan_grace_seconds=3600)
++    rel = [r for r in ok.rows() if r["stage"] == "reserve"
++           and r["state"] == "RELEASED"]
++    assert [r["reason"] for r in rel] == ["ORPHAN"]
++    assert gw2.derive_approval("c", 5000, "USD") is not None
++    assert prov.calls == 0
++
++
++def test_R11_orphan_rule_fails_closed_when_send_evidence_exists(tmp_path):
++    """RESERVED/SENT without a GRANTED row but WITH send evidence is an
++    anomaly, never a release."""
++    import time
++    ledger, claims, gw, prov = plain(tmp_path)
++    ok, _ = claims.reserve("AP-ghost", 5000, ledger._now()[:10], BUDGET,
++                           now=time.time())
++    assert ok
++    ledger.append("claim", "CLAIMED", "AP-ghost -> EX-x",
++                  approval_id="AP-ghost", execution_id="EX-x")
++    recover_on_startup(ledger, claims, prov, now=time.time() + 7200,
++                       orphan_grace_seconds=0)
++    assert states(ledger, "reserve").count("ANOMALY") == 1
++    assert "RELEASED" not in states(ledger, "reserve")
++    assert gw.derive_approval("a", 5000, "USD") is not None   # 5000 still held
++    assert gw.derive_approval("b", 5000, "USD") is None
++
++
++def test_R12_execute_without_reservation_is_denied_no_provider_call(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    # a GRANTED row that never went through the reservation path
++    ledger.append("approval", "GRANTED", "AP-forged", approval_id="AP-forged",
++                  approver="x (pre-auth)", amount_minor=5000, currency="USD",
++                  item="coffee")
++    row = gw.execute({"approval_id": "AP-forged", "amount_minor": 5000,
++                      "currency": "USD", "item": "coffee"})
++    assert row["state"] == "DENIED_NO_RESERVATION"
++    assert prov.calls == 0
++
++
++def test_R13_human_approval_counts_as_spend_but_is_not_gated(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    h = gw.grant_human_approval("big", 12_000, "USD", "manager")  # > budget
++    assert gw.execute(h)["state"] == "EXECUTED"               # unchanged
++    assert gw.derive_approval("coffee", 100, "USD") is None   # but it is spend
++    assert states(ledger, "approval")[-1] == "DENIED_DAILY_BUDGET"
++    assert prov.total_minor == 12_000
++
++
++def test_R14_double_execute_still_one_provider_call(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    ap = gw.derive_approval("a", 5000, "USD")
++    assert gw.execute(ap)["state"] == "EXECUTED"
++    assert gw.execute(ap)["state"] == "DENIED_APPROVAL_CONSUMED"
++    assert prov.calls == 1
++
++
++def test_R15_seeded_random_schedule_never_exceeds_budget(tmp_path):
++    rnd = random.Random(1609)
++    clock, ledger, claims, gw, prov = timed(tmp_path, budget=20_000)
++    pending = []
++    for step in range(300):
++        op = rnd.choice(["derive", "derive", "exec", "exec", "fail", "tick",
++                         "recover"])
++        if op == "derive":
++            ap = gw.derive_approval("x", rnd.choice([500, 1000, 2500, 5000]),
++                                    "USD")
++            if ap:
++                pending.append(ap)
++        elif op in ("exec", "fail") and pending:
++            ap = pending.pop(rnd.randrange(len(pending)))
++            prov.mode = "reject" if op == "fail" else rnd.choice(
++                ["ok", "ok", "lost_after"])
++            gw.execute(ap)
++            prov.mode = "ok"
++        elif op == "tick":
++            clock.t += rnd.choice([10, 100, 400])
++        elif op == "recover":
++            recover_on_startup(ledger, claims, prov, now=clock())
++        assert prov.total_minor <= 20_000, (step, op, prov.total_minor)
++
++
++# ------------------------------------------------------------------- api
++def test_R16_api_committed_minor_tracks_state_machine(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    day = ledger._now()[:10]
++    ap = gw.derive_approval("a", 3000, "USD")
++    assert claims.committed_minor(day) == 3000                # RESERVED
++    gw.execute(ap)
++    assert claims.committed_minor(day) == 3000                # CONSUMED
++    claims.set_status(ledger.last(stage="execute", state="EXECUTED")
++                      ["execution_id"], "REJECTED")           # must NOT release
++    assert claims.committed_minor(day) == 3000                # consumed is final
++
++
++def test_R17_api_release_is_idempotent_and_single(tmp_path):
++    ledger, claims, gw, prov = plain(tmp_path)
++    day = ledger._now()[:10]
++    prov.mode = "reject"
++    row = gw.execute(gw.derive_approval("a", 3000, "USD"))
++    assert row["state"] == "REJECTED" and claims.committed_minor(day) == 0
++    claims.set_status(row["execution_id"], "REJECTED")        # again
++    claims.set_status(row["execution_id"], "NOT_EXECUTED")    # and again
++    assert claims.committed_minor(day) == 0                   # not negative
++
++
++def test_R18_api_verify_reservations_reports_disagreement(tmp_path):
++    from sanad.reconcile import verify_reservations
++    ledger, claims, gw, prov = plain(tmp_path)
++    ap = gw.derive_approval("a", 3000, "USD")
++    gw.execute(ap)
++    assert verify_reservations(ledger, claims) == []
++    # simulate a lost database row
++    import sqlite3
++    c = sqlite3.connect(str(tmp_path / "claims.db"))
++    c.execute("DELETE FROM reservations")
++    c.commit()
++    c.close()
++    kinds = {a["kind"] for a in verify_reservations(ledger, claims)}
++    assert "NO_RESERVATION_ROW" in kinds
++
++
++def test_R19_api_consumed_without_ledger_evidence_is_flagged(tmp_path):
++    from sanad.reconcile import verify_reservations
++    import time
++    ledger, claims, gw, prov = plain(tmp_path)
++    claims.reserve("AP-x", 100, ledger._now()[:10], BUDGET, now=time.time())
++    ledger.append("approval", "GRANTED", "AP-x", approval_id="AP-x",
++                  amount_minor=100, currency="USD", item="i")
++    claims.begin_send("AP-x", "EX-x")
++    claims.set_status("EX-x", "EXECUTED")                     # CONSUMED, no ledger
++    kinds = {a["kind"] for a in verify_reservations(ledger, claims)}
++    assert "CONSUMED_NOT_IN_LEDGER" in kinds
++
++
++def test_R20_real_process_death_mid_flight_is_held_then_settled(tmp_path):
++    """os._exit between the claim and the provider result."""
++    import subprocess, sys
++    ledger, claims, gw, prov = plain(tmp_path)               # signs + makes db
++    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                          "_exp016_os_exit_crash.py")
++    r = subprocess.run([sys.executable, script, here, str(tmp_path)],
++                       timeout=60)
++    assert r.returncode == 7
++    # the dead process left a claim and a held reservation, no result
++    assert claims.unresolved() != []
++    assert gw.derive_approval("a", 5000, "USD") is not None   # 5000 held + 5000
++    assert gw.derive_approval("b", 5000, "USD") is None       # full
++    recover_on_startup(ledger, claims, prov)                  # no trace
++    assert ledger.last(stage="resolve")["state"] == "NOT_EXECUTED"
++    assert gw.derive_approval("b", 5000, "USD") is not None   # released
+diff --git a/tests/test_gateway_timed.py b/tests/test_gateway_timed.py
+index 7961eb7..6c08378 100644
+--- a/tests/test_gateway_timed.py
++++ b/tests/test_gateway_timed.py
+@@ -51,6 +51,21 @@ class FakeClaims:
+     def set_status(self, execution_id, s):
+         self.status[execution_id] = s
+ 
++    # EXP-016 (declared test edit): the Gateway now reserves budget and
++    # claims through begin_send(); this fake keeps its old semantics.
++    def reserve(self, approval_id, amount_minor, day, budget_minor,
++                expires_at=None, gated=True, now=None):
++        return True, 0
++
++    def release_expired(self, now=None):
++        return []
++
++    def begin_send(self, approval_id, execution_id):
++        if approval_id in self.claimed:
++            return "CONSUMED"
++        self.claimed[approval_id] = execution_id
++        return "OK"
++
+ 
+ class FakeProvider:
+     def __init__(self):
+diff --git a/tests/test_unknown_lab.py b/tests/test_unknown_lab.py
+index 9ed7c16..bb205d7 100644
+--- a/tests/test_unknown_lab.py
++++ b/tests/test_unknown_lab.py
+@@ -54,6 +54,21 @@ class FakeClaims:
+     def set_status(self, execution_id, s):
+         self.status[execution_id] = s
+ 
++    # EXP-016 (declared test edit): the Gateway now reserves budget and
++    # claims through begin_send(); this fake keeps its old semantics.
++    def reserve(self, approval_id, amount_minor, day, budget_minor,
++                expires_at=None, gated=True, now=None):
++        return True, 0
++
++    def release_expired(self, now=None):
++        return []
++
++    def begin_send(self, approval_id, execution_id):
++        if approval_id in self.claimed:
++            return "CONSUMED"
++        self.claimed[approval_id] = execution_id
++        return "OK"
++
+ 
+ class MidFlightCrash(BaseException):
+     """A crash the Gateway must NOT swallow — process death, not an error."""

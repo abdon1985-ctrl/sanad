@@ -1,0 +1,580 @@
+diff --git a/sanad/claims.py b/sanad/claims.py
+index 985e571..4c47ac6 100644
+--- a/sanad/claims.py
++++ b/sanad/claims.py
+@@ -103,16 +103,21 @@ class ClaimStore:
+         finally:
+             c.close()
+ 
+-    def begin_send(self, approval_id, execution_id):
+-        """One transaction: the reservation must be RESERVED, the claim row is
+-        inserted, the reservation becomes SENT. Returns 'OK' | 'CONSUMED' |
+-        'NO_RESERVATION' | 'RESERVATION_<STATUS>'. Nothing is consumed unless
+-        'OK' — a refused attempt never burns the approval."""
++    def begin_send(self, approval_id, execution_id, now=None):
++        """One transaction: expiry is decided HERE, from the trusted
++        reservation (EXP-017), the claim row is inserted, and the
++        reservation becomes SENT. Expired  <=>  now > expires_at.
++        Returns 'OK' | 'CONSUMED' | 'EXPIRED' (this call released it) |
++        'EXPIRED_ALREADY' | 'NO_RESERVATION' | 'RESERVATION_<STATUS>'.
++        Nothing is consumed unless 'OK' — a refused attempt never burns the
++        approval, and an expired one is released exactly once."""
++        now = time.time() if now is None else now
+         c = self._tx()
+         try:
+             c.execute("BEGIN IMMEDIATE")
+-            row = c.execute("SELECT status FROM reservations WHERE approval_id=?",
+-                            (approval_id,)).fetchone()
++            row = c.execute(
++                "SELECT status, expires_at, release_reason FROM reservations "
++                "WHERE approval_id=?", (approval_id,)).fetchone()
+             if row is None:
+                 c.execute("ROLLBACK")
+                 return "NO_RESERVATION"
+@@ -120,14 +125,25 @@ class ClaimStore:
+                          (approval_id,)).fetchone():
+                 c.execute("ROLLBACK")
+                 return "CONSUMED"
+-            if row[0] != "RESERVED":
++            status, expires_at, reason = row
++            if status == "RELEASED" and reason == "EXPIRED":
++                c.execute("ROLLBACK")
++                return "EXPIRED_ALREADY"
++            if status != "RESERVED":
+                 c.execute("ROLLBACK")
+-                return "RESERVATION_" + row[0]
++                return "RESERVATION_" + status
++            if expires_at is not None and now > expires_at:
++                c.execute("UPDATE reservations SET status='RELEASED', "
++                          "release_reason='EXPIRED', released_at=? "
++                          "WHERE approval_id=? AND status='RESERVED'",
++                          (now, approval_id))
++                c.execute("COMMIT")
++                return "EXPIRED"
+             c.execute("INSERT INTO executions VALUES (?,?,'PENDING')",
+                       (approval_id, execution_id))
+-            c.execute("UPDATE reservations SET status='SENT', execution_id=? "
+-                      "WHERE approval_id=? AND status='RESERVED'",
+-                      (execution_id, approval_id))
++            c.execute("UPDATE reservations SET status='SENT', "
++                      "execution_id=? WHERE approval_id=? "
++                      "AND status='RESERVED'", (execution_id, approval_id))
+             c.execute("COMMIT")
+             return "OK"
+         except BaseException:
+@@ -154,7 +170,7 @@ class ClaimStore:
+             c.execute("BEGIN IMMEDIATE")
+             ids = [r[0] for r in c.execute(
+                 "SELECT approval_id FROM reservations WHERE status='RESERVED' "
+-                "AND expires_at IS NOT NULL AND expires_at<=?", (now,))]
++                "AND expires_at IS NOT NULL AND expires_at<?", (now,))]
+             _sweep_expired(c, now)
+             c.execute("COMMIT")
+             return ids
+@@ -225,7 +241,7 @@ class ClaimStore:
+ # A GRANTED approval now holds budget from the moment it is granted, in the
+ # same SQLite file that already arbitrates the claim. State machine:
+ #
+-#   RESERVED --begin_send--> SENT --EXECUTED--> CONSUMED   (counts, final)
++#   RESERVED --begin_send--> SENT   (begin_send also decides expiry: now > expires_at) --EXECUTED--> CONSUMED   (counts, final)
+ #      |                       `---REJECTED/NOT_EXECUTED--> RELEASED
+ #      `--expired / orphan--> RELEASED
+ #
+@@ -269,4 +285,4 @@ def _sweep_expired(c, now):
+     c.execute("UPDATE reservations SET status='RELEASED', "
+               "release_reason='EXPIRED', released_at=? "
+               "WHERE status='RESERVED' AND expires_at IS NOT NULL "
+-              "AND expires_at<=?", (now, now))
++              "AND expires_at<?", (now, now))
+diff --git a/sanad/gateway.py b/sanad/gateway.py
+index f373f64..12442da 100644
+--- a/sanad/gateway.py
++++ b/sanad/gateway.py
+@@ -183,12 +183,28 @@ class Gateway:
+         # (1) atomic claim in SQLite — the race arbiter. EXP-016: claim and
+         #     reservation RESERVED->SENT happen in ONE transaction, and only
+         #     a live reservation can be claimed.
+-        res = self.claims.begin_send(approval["approval_id"], execution_id)
++        res = self.claims.begin_send(approval["approval_id"], execution_id,
++                                     now=self._now_epoch())
+         if res == "CONSUMED":
+             return self.ledger.append(
+                 "execute", "DENIED_APPROVAL_CONSUMED",
+                 f"{approval['approval_id']} already claimed",
+                 approval_id=approval["approval_id"])
++        if res in ("EXPIRED", "EXPIRED_ALREADY"):
++            # EXP-017: expiry was decided from the trusted reservation, not
++            # from anything the caller holds.
++            row = self.ledger.append(
++                "execute", "DENIED_APPROVAL_EXPIRED",
++                f"{approval['approval_id']} is past its signed expiry — "
++                "approval not consumed, no provider call",
++                approval_id=approval["approval_id"])
++            if res == "EXPIRED":     # only the call that released it logs it
++                self.ledger.append(
++                    "reserve", "RELEASED",
++                    f"{approval['approval_id']} expired unexecuted — "
++                    "budget returned",
++                    approval_id=approval["approval_id"], reason="EXPIRED")
++            return row
+         if res != "OK":
+             state = ("DENIED_NO_RESERVATION" if res == "NO_RESERVATION"
+                      else "DENIED_" + res)
+diff --git a/sanad/gateway_timed.py b/sanad/gateway_timed.py
+index 56c80b1..ad6c0b8 100644
+--- a/sanad/gateway_timed.py
++++ b/sanad/gateway_timed.py
+@@ -85,17 +85,14 @@ class TimedGateway(Gateway):
+         approval["ttl_seconds"] = ttl_seconds
+         return approval
+ 
+-    # ---------- execution: expiry refused BEFORE the claim ------------
++    # ---------- execution ---------------------------------------------
++    # EXP-017: there is deliberately NO expiry check here any more. It used
++    # to read ttl_seconds / issued_at from the approval dict — fields the
++    # caller holds and can edit (GAP-TTL-1). Expiry is now decided inside
++    # Gateway.execute -> ClaimStore.begin_send, from reservations.expires_at
++    # (written at derivation from SIGNED terms). Those two dict fields are
++    # informational only and are never read for a decision.
+     def execute(self, approval: dict):
+         if approval is None:
+             return None
+-        ttl = approval.get("ttl_seconds")
+-        if ttl is not None:
+-            age = self.clock() - approval.get("issued_at", 0)
+-            if age > ttl:
+-                return self.ledger.append(
+-                    "execute", "DENIED_APPROVAL_EXPIRED",
+-                    f"{approval['approval_id']} issued {age:.0f}s ago, "
+-                    f"ttl {ttl}s — approval not consumed, no provider call",
+-                    approval_id=approval["approval_id"])
+         return super().execute(approval)
+diff --git a/sanad/reconcile.py b/sanad/reconcile.py
+index 8284828..06d4b62 100644
+--- a/sanad/reconcile.py
++++ b/sanad/reconcile.py
+@@ -163,6 +163,12 @@ def verify_reservations(ledger: Ledger, claims: ClaimStore) -> list:
+         if g.get("reservation_day") and aid not in table:
+             found.append({"kind": "NO_RESERVATION_ROW", "approval_id": aid})
+     for aid, row in table.items():
++        g = granted_rows.get(aid)
++        if g is not None and "expires_at" in g:
++            a, b = g["expires_at"], row["expires_at"]
++            if (a is None) != (b is None) or (a is not None
++                                              and abs(a - b) > 1e-6):
++                found.append({"kind": "EXPIRY_MISMATCH", "approval_id": aid})
+         if row["status"] in ("RESERVED", "SENT", "CONSUMED") \
+                 and aid not in granted_rows:
+             found.append({"kind": "NO_GRANTED_ROW", "approval_id": aid})
+diff --git a/tests/test_exp017_expiry.py b/tests/test_exp017_expiry.py
+new file mode 100644
+index 0000000..6ab7699
+--- /dev/null
++++ b/tests/test_exp017_expiry.py
+@@ -0,0 +1,344 @@
++# -*- coding: utf-8 -*-
++"""EXP-017 — approval expiry is decided by the trusted reservation, not by
++the caller's dict (acceptance tests, written FIRST, stacked on EXP-016).
++
++Fix target: GAP-TTL-1. Before: TimedGateway.execute() read ttl_seconds and
++issued_at from the approval dict the caller holds, so editing them executed
++an approval after its signed expiry.
++After: the decision is `now > reservations.expires_at`, made inside the same
++SQLite transaction that claims the approval. `expires_at` was written by the
++gateway at derivation from SIGNED terms: min(issue + approval_ttl_seconds,
++signed_at + valid_days days).
++
++ONE BOUNDARY EVERYWHERE:  expired  <=>  now > expires_at.
++At now == expires_at the approval is still valid; execution, the lazy
++sweeper and startup recovery must all agree.
++
++Measurement rule: "executed" means the provider witness was called AND an
++execute/EXECUTED row exists; "refused" means zero provider calls.
++Kinds: behavioural (meaningful on the baseline) / api (new signature).
++"""
++import json
++import os
++import threading
++import time
++
++from sanad import Ledger, ClaimStore, Gateway
++from sanad.binding import BoundGateway
++from sanad.gateway_timed import TimedGateway
++from sanad.identity import Signer
++from sanad.providers import Provider
++from sanad.reconcile import recover_on_startup, verify_reservations
++from sanad.validity import TrustedKeys, TimedSignedPreAuthorization, timed_sign
++
++TTL = 300
++
++
++class Crash(BaseException):
++    pass
++
++
++class Witness(Provider):
++    name = "memory"
++
++    def __init__(self):
++        self.calls, self.total_minor, self.records, self.mode = 0, 0, {}, "ok"
++        self._lock = threading.Lock()
++
++    def execute(self, amount_minor, currency, execution_id):
++        with self._lock:
++            self.calls += 1
++            self.total_minor += amount_minor
++            self.records[execution_id] = {"receipt": "rc_" + execution_id,
++                                          "amount_minor": amount_minor}
++        if self.mode == "lost_after":
++            raise TimeoutError("charged, response lost")
++        return self.records[execution_id]
++
++    def find_by_execution_id(self, execution_id):
++        return self.records.get(execution_id)
++
++    def retrieve(self, receipt):
++        raise LookupError(receipt)
++
++
++class Clock:
++    def __init__(self, t=1_000_000.0):
++        self.t = t
++
++    def __call__(self):
++        return self.t
++
++
++def world(tmp_path, budget=100_000, extra=None, cls=TimedGateway,
++          ledger_cls=Ledger):
++    clock = Clock()
++    ledger = ledger_cls(str(tmp_path / "ledger.jsonl"))
++    claims = ClaimStore(str(tmp_path / "claims.db"))
++    terms = {"auto_limit_minor": 5000, "daily_budget_minor": budget,
++             "currency": "USD", "blocked_categories": [], "valid_days": 7,
++             "approval_ttl_seconds": TTL}
++    terms.update(extra or {})
++    doc = tmp_path / "pre_auth.json"
++    doc.write_text(json.dumps(terms), encoding="utf-8")
++    m = Signer("mohamed")
++    keys = TrustedKeys(ledger, {"mohamed": m.public_key_b64}, clock=clock)
++    pre = TimedSignedPreAuthorization(ledger, str(doc), keys, clock=clock)
++    timed_sign(pre, m)
++    prov = Witness()
++    if cls is BoundGateway:
++        gw = BoundGateway(ledger, claims, pre, prov, Signer("agent"),
++                          clock=clock)
++    else:
++        gw = cls(ledger, claims, pre, prov, clock=clock)
++    return clock, ledger, claims, gw, prov
++
++
++def rows(ledger, stage, state=None):
++    return [r for r in ledger.rows()
++            if r["stage"] == stage and (state is None or r["state"] == state)]
++
++
++def assert_refused_expired(row, ledger, prov):
++    assert row["state"] == "DENIED_APPROVAL_EXPIRED", row["state"]
++    assert prov.calls == 0
++    assert not rows(ledger, "execute", "EXECUTED")
++
++
++# --------------------------------------------------------------- tampering
++TAMPERS = {
++    "ttl_none":       lambda ap, c: ap.__setitem__("ttl_seconds", None),
++    "ttl_huge":       lambda ap, c: ap.__setitem__("ttl_seconds", 10 ** 9),
++    "ttl_deleted":    lambda ap, c: ap.pop("ttl_seconds"),
++    "issued_at_now":  lambda ap, c: ap.__setitem__("issued_at", c()),
++    "issued_at_future": lambda ap, c: ap.__setitem__("issued_at", c() + 10**6),
++    "issued_at_deleted": lambda ap, c: ap.pop("issued_at"),
++    "both":           lambda ap, c: (ap.__setitem__("ttl_seconds", None),
++                                     ap.__setitem__("issued_at", c())),
++}
++
++
++def test_X1_control_untampered_expired_is_refused(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    ap = gw.derive_approval("a", 3000, "USD")
++    clock.t += TTL + 1
++    assert_refused_expired(gw.execute(ap), ledger, prov)
++
++
++def test_X2_every_dict_tamper_after_expiry_is_refused(tmp_path):
++    for i, (name, tamper) in enumerate(TAMPERS.items()):
++        sub = tmp_path / f"t{i}"
++        sub.mkdir()
++        clock, ledger, claims, gw, prov = world(sub)
++        ap = gw.derive_approval("a", 3000, "USD")
++        clock.t += 86_400                                  # a full day late
++        tamper(ap, clock)
++        row = gw.execute(ap)
++        assert row["state"] == "DENIED_APPROVAL_EXPIRED", (name, row["state"])
++        assert prov.calls == 0 and not rows(ledger, "execute", "EXECUTED"), name
++
++
++def test_X3_dict_cannot_shorten_a_still_valid_approval(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    ap = gw.derive_approval("a", 3000, "USD")
++    clock.t += 10                                          # well inside TTL
++    ap["ttl_seconds"], ap["issued_at"] = 1, 0              # "expired" on paper
++    assert gw.execute(ap)["state"] == "EXECUTED"           # dict is not read
++    assert prov.calls == 1
++
++
++def test_X4_boundary_valid_at_equality_expired_just_after(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    ap = gw.derive_approval("a", 3000, "USD")
++    t0 = clock.t
++    clock.t = t0 + TTL                                     # now == expires_at
++    assert gw.execute(ap)["state"] == "EXECUTED"
++    ap2 = gw.derive_approval("b", 3000, "USD")             # issued at t0+300
++    clock.t = clock.t + TTL + 1e-6                         # now > expires_at
++    row = gw.execute(ap2)
++    assert row["state"] == "DENIED_APPROVAL_EXPIRED"
++    assert prov.calls == 1
++
++
++def test_X5_sweeper_agrees_with_execution_at_the_boundary(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path, budget=5000)
++    a1 = gw.derive_approval("a", 5000, "USD")
++    t0 = clock.t
++    clock.t = t0 + TTL                                     # == expires_at
++    assert gw.derive_approval("b", 5000, "USD") is None    # still held
++    assert not rows(ledger, "reserve", "RELEASED")
++    assert gw.execute(a1)["state"] == "EXECUTED"           # and still usable
++    clock.t = t0 + TTL + 1e-6
++    a2 = gw.derive_approval("c", 5000, "USD")              # a1 consumed: full
++    assert a2 is None
++
++
++def test_X6_recovery_agrees_at_the_boundary(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    gw.derive_approval("a", 3000, "USD")
++    t0 = clock.t
++    recover_on_startup(ledger, claims, prov, now=t0 + TTL)
++    assert not rows(ledger, "reserve", "RELEASED")         # == : still valid
++    recover_on_startup(ledger, claims, prov, now=t0 + TTL + 1e-6)
++    rel = rows(ledger, "reserve", "RELEASED")
++    assert [r["reason"] for r in rel] == ["EXPIRED"]
++
++
++def test_X7_shorter_mandate_governs_over_longer_approval_ttl(tmp_path):
++    clock, ledger, claims, gw, prov = world(
++        tmp_path, extra={"valid_days": 1, "approval_ttl_seconds": 10 * 86400})
++    signed_at = rows(ledger, "pre_auth", "SIGNED")[0]["signed_at"]
++    clock.t = signed_at + 86_000
++    ap = gw.derive_approval("a", 3000, "USD")              # ttl says +10 days
++    clock.t = signed_at + 86_401                           # mandate has ended
++    ap["ttl_seconds"] = None
++    assert_refused_expired(gw.execute(ap), ledger, prov)
++
++
++def test_X8_human_approval_ttl_binds_and_no_ttl_never_expires(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    h = gw.grant_human_approval("big", 12_000, "USD", "mgr", ttl_seconds=TTL)
++    clock.t += TTL + 1
++    h["ttl_seconds"] = None                                # tamper
++    assert_refused_expired(gw.execute(h), ledger, prov)
++    h2 = gw.grant_human_approval("big", 12_000, "USD", "mgr")   # no ttl
++    clock.t += 10 * 365 * 86_400
++    assert gw.execute(h2)["state"] == "EXECUTED"           # unchanged policy
++
++
++def test_X9_bound_gateway_follows_the_same_rule(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path, cls=BoundGateway)
++    ap = gw.derive_approval("a", 3000, "USD")
++    clock.t += TTL + 1
++    ap["ttl_seconds"] = None
++    assert_refused_expired(gw.execute(ap), ledger, prov)
++
++
++def test_X10_sent_unknown_is_not_touched_by_expiry(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    prov.mode = "lost_after"
++    ap = gw.derive_approval("a", 3000, "USD")
++    assert gw.execute(ap)["state"] == "UNKNOWN"
++    prov.mode = "ok"
++    clock.t += 10 * TTL
++    # an approval that was actually sent is CONSUMED, not "expired"
++    assert gw.execute(ap)["state"] == "DENIED_APPROVAL_CONSUMED"
++    recover_on_startup(ledger, claims, prov, now=clock())
++    assert not rows(ledger, "reserve", "RELEASED")
++    assert ledger.last(stage="resolve")["state"] == "EXECUTED"
++    assert prov.calls == 1
++
++
++def test_X11_expired_release_happens_once_and_is_logged_once(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path, budget=5000)
++    ap = gw.derive_approval("a", 5000, "USD")
++    clock.t += TTL + 1
++    for _ in range(3):
++        assert gw.execute(ap)["state"] == "DENIED_APPROVAL_EXPIRED"
++    rel = rows(ledger, "reserve", "RELEASED")
++    assert [r["reason"] for r in rel] == ["EXPIRED"]
++    assert claims.committed_minor(ledger._now()[:10]) == 0     # once, not -N
++    assert gw.derive_approval("b", 5000, "USD") is not None    # budget is back
++
++
++def test_X12_many_threads_on_one_expired_approval(tmp_path):
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    ap = gw.derive_approval("a", 3000, "USD")
++    clock.t += TTL + 1
++    out, barrier = [], threading.Barrier(8)
++
++    def w():
++        barrier.wait(timeout=10)
++        out.append(gw.execute(dict(ap))["state"])
++
++    ts = [threading.Thread(target=w) for _ in range(8)]
++    [t.start() for t in ts]
++    [t.join(timeout=30) for t in ts]
++    assert out == ["DENIED_APPROVAL_EXPIRED"] * 8
++    assert prov.calls == 0
++    assert len(rows(ledger, "reserve", "RELEASED")) == 1
++
++
++def test_X13_crash_between_release_and_logging_recovers_idempotently(tmp_path):
++    """Crash at EITHER ledger write that follows the SQLite release."""
++    for i, (stage, state) in enumerate([("execute", "DENIED_APPROVAL_EXPIRED"),
++                                        ("reserve", "RELEASED")]):
++        sub = tmp_path / f"c{i}"
++        sub.mkdir()
++
++        class CrashAt(Ledger):
++            def append(self, st, sta, detail="", **f):
++                if (st, sta) == (stage, state):
++                    raise Crash()
++                return super().append(st, sta, detail, **f)
++
++        clock, ledger, claims, gw, prov = world(sub, ledger_cls=CrashAt)
++        ap = gw.derive_approval("a", 3000, "USD")
++        clock.t += TTL + 1
++        try:
++            gw.execute(ap)
++            raise AssertionError("expected crash")
++        except Crash:
++            pass
++        ok = Ledger(str(sub / "ledger.jsonl"))                   # restart
++        cs = ClaimStore(str(sub / "claims.db"))
++        for _ in range(2):                                       # idempotent
++            recover_on_startup(ok, cs, prov, now=clock())
++        assert len(rows(ok, "reserve", "RELEASED")) == 1, (stage, state)
++        assert cs.committed_minor(ok._now()[:10]) == 0
++        assert prov.calls == 0
++
++
++def test_X14_verify_reports_expiry_mismatch(tmp_path):
++    import sqlite3
++    clock, ledger, claims, gw, prov = world(tmp_path)
++    gw.derive_approval("a", 3000, "USD")
++    assert verify_reservations(ledger, claims) == []
++    c = sqlite3.connect(str(tmp_path / "claims.db"))
++    c.execute("UPDATE reservations SET expires_at = expires_at + 999999")
++    c.commit()
++    c.close()
++    assert "EXPIRY_MISMATCH" in {a["kind"]
++                                 for a in verify_reservations(ledger, claims)}
++
++
++# ------------------------------------------------------------------- api
++def test_X15_api_begin_send_decides_expiry_in_its_own_transaction(tmp_path):
++    claims = ClaimStore(str(tmp_path / "c.db"))
++    claims.reserve("AP-1", 100, "2026-01-01", 10_000, expires_at=1000.0,
++                   now=900.0)
++    assert claims.begin_send("AP-1", "EX-1", now=1000.0) == "OK"      # ==
++    claims.reserve("AP-2", 100, "2026-01-01", 10_000, expires_at=1000.0,
++                   now=900.0)
++    assert claims.begin_send("AP-2", "EX-2", now=1000.001) == "EXPIRED"
++    assert claims.begin_send("AP-2", "EX-3", now=1000.001) == "EXPIRED_ALREADY"
++    assert claims.committed_minor("2026-01-01") == 100                # AP-1 only
++    assert claims.status_of("EX-2") is None                           # no claim
++
++
++def test_X16_api_execute_vs_sweep_race_never_does_both(tmp_path):
++    for i in range(40):
++        sub = tmp_path / f"r{i}"
++        sub.mkdir()
++        claims = ClaimStore(str(sub / "c.db"))
++        claims.reserve("AP-1", 100, "2026-01-01", 10_000, expires_at=1000.0,
++                       now=900.0)
++        barrier, res = threading.Barrier(2), {}
++
++        def execute():
++            barrier.wait(timeout=10)
++            res["send"] = claims.begin_send("AP-1", "EX-1", now=1000.0)
++
++        def sweep():
++            barrier.wait(timeout=10)
++            res["swept"] = claims.release_expired(now=1000.001)
++
++        ts = [threading.Thread(target=execute), threading.Thread(target=sweep)]
++        [t.start() for t in ts]
++        [t.join(timeout=10) for t in ts]
++        row = claims.reservation_rows()[0]
++        if res["send"] == "OK":
++            assert row["status"] == "SENT" and res["swept"] == []
++        else:
++            assert res["send"] == "EXPIRED_ALREADY"
++            assert row["status"] == "RELEASED" and res["swept"] == ["AP-1"]
+diff --git a/tests/test_gateway_timed.py b/tests/test_gateway_timed.py
+index 6c08378..0d54bb2 100644
+--- a/tests/test_gateway_timed.py
++++ b/tests/test_gateway_timed.py
+@@ -55,14 +55,18 @@ class FakeClaims:
+     # claims through begin_send(); this fake keeps its old semantics.
+     def reserve(self, approval_id, amount_minor, day, budget_minor,
+                 expires_at=None, gated=True, now=None):
++        self.__dict__.setdefault("expires", {})[approval_id] = expires_at
+         return True, 0
+ 
+     def release_expired(self, now=None):
+         return []
+ 
+-    def begin_send(self, approval_id, execution_id):
++    def begin_send(self, approval_id, execution_id, now=None):
+         if approval_id in self.claimed:
+             return "CONSUMED"
++        exp = self.__dict__.get("expires", {}).get(approval_id)
++        if exp is not None and now is not None and now > exp:   # EXP-017
++            return "EXPIRED"
+         self.claimed[approval_id] = execution_id
+         return "OK"
+ 
+@@ -160,6 +164,13 @@ def test_T2_within_ttl_executes(tmp_path):
+ def test_T3_no_ttl_never_expires(tmp_path):
+     terms = dict(BASE)
+     terms.pop("approval_ttl_seconds")
++    # EXP-017 (declared test edit, SEMANTIC CHANGE): an approval no longer
++    # outlives the signed mandate's valid_days, so this test's premise —
++    # "absence of an approval ttl means no approval-level expiry" — now has
++    # to remove valid_days as well to isolate what it is about. The new
++    # behaviour (mandate end also ends the approval) is covered by
++    # test_exp017_expiry.py::test_X7.
++    terms.pop("valid_days", None)
+     clock, _, _, _, gw, provider = build(tmp_path, terms)
+     ap = gw.derive_approval("coffee", 3000, "USD")
+     clock.advance_days(30)
+diff --git a/tests/test_unknown_lab.py b/tests/test_unknown_lab.py
+index bb205d7..f9effa1 100644
+--- a/tests/test_unknown_lab.py
++++ b/tests/test_unknown_lab.py
+@@ -58,14 +58,18 @@ class FakeClaims:
+     # claims through begin_send(); this fake keeps its old semantics.
+     def reserve(self, approval_id, amount_minor, day, budget_minor,
+                 expires_at=None, gated=True, now=None):
++        self.__dict__.setdefault("expires", {})[approval_id] = expires_at
+         return True, 0
+ 
+     def release_expired(self, now=None):
+         return []
+ 
+-    def begin_send(self, approval_id, execution_id):
++    def begin_send(self, approval_id, execution_id, now=None):
+         if approval_id in self.claimed:
+             return "CONSUMED"
++        exp = self.__dict__.get("expires", {}).get(approval_id)
++        if exp is not None and now is not None and now > exp:   # EXP-017
++            return "EXPIRED"
+         self.claimed[approval_id] = execution_id
+         return "OK"
+ 
